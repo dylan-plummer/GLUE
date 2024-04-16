@@ -23,7 +23,7 @@ from ..num import normalize_edges
 from ..utils import AUTO, config, get_chained_attr, logged
 from . import sc
 from .base import Model
-from .data import AnnDataset, ArrayDataset, DataLoader, GraphDataset
+from .data import AnnDataset, ArrayDataset, DataLoader, GraphDataset, GraphDatasetWithAttr
 from .glue import GLUE, GLUETrainer
 from .nn import freeze_running_stats
 
@@ -56,6 +56,8 @@ register_prob_model("ZIN", sc.VanillaDataEncoder, sc.ZINDataDecoder)
 register_prob_model("ZILN", sc.VanillaDataEncoder, sc.ZILNDataDecoder)
 register_prob_model("NB", sc.NBDataEncoder, sc.NBDataDecoder)
 register_prob_model("ZINB", sc.NBDataEncoder, sc.ZINBDataDecoder)
+register_prob_model("HiCNB", sc.HiCDataEncoder, sc.StratifiedNBDataDecoder)  # same encoder but strata-specific decoder
+register_prob_model("HiCZINB", sc.HiCDataEncoderGraphConv, sc.StratifiedZINBDataDecoder)  # same encoder but strata-specific decoder
 
 
 #----------------------------- Network definition ------------------------------
@@ -91,10 +93,14 @@ class SCGLUE(GLUE):
             u2x: Mapping[str, sc.DataDecoder],
             idx: Mapping[str, torch.Tensor],
             du: sc.Discriminator, prior: sc.Prior,
-            u2c: Optional[sc.Classifier] = None
+            durds: sc.Discriminator = None,
+            u2c: Optional[sc.Classifier] = None,
+            use_node_attributes: bool = False
     ) -> None:
         super().__init__(g2v, v2g, x2u, u2x, idx, du, prior)
         self.u2c = u2c.to(self.device) if u2c else None
+        self.durds = durds.to(self.device) if durds else None
+        self.use_node_attributes = use_node_attributes
 
 
 class IndSCGLUE(SCGLUE):
@@ -212,6 +218,8 @@ class SCGLUETrainer(GLUETrainer):
                     self.net.u2c.parameters()
                 ), lr=self.lr, **kwargs
             )
+        if net.durds:
+            self.required_losses.append("dsc_rds_loss")
 
     @property
     def freeze_u(self) -> bool:
@@ -239,9 +247,14 @@ class SCGLUETrainer(GLUETrainer):
         device = self.net.device
         keys = self.net.keys
         K = len(keys)
-        x, xrep, xbch, xlbl, xdwt, (eidx, ewt, esgn) = \
+        if self.net.use_node_attributes:
+            x, xrep, xbch, xlbl, xdwt, (eidx, ewt, esgn, eattr) = \
             data[0:K], data[K:2*K], data[2*K:3*K], data[3*K:4*K], data[4*K:5*K], \
             data[5*K+1:]
+        else:
+            x, xrep, xbch, xlbl, xdwt, xrds, (eidx, ewt, esgn) = \
+                data[0:K], data[K:2*K], data[2*K:3*K], data[3*K:4*K], data[4*K:5*K], data[5*K:6*K] ,\
+                data[6*K+1:]
         x = {
             k: x[i].to(device, non_blocking=True)
             for i, k in enumerate(keys)
@@ -262,6 +275,10 @@ class SCGLUETrainer(GLUETrainer):
             k: xdwt[i].to(device, non_blocking=True)
             for i, k in enumerate(keys)
         }
+        xrds = {
+            k: xrds[i].to(device, non_blocking=True)
+            for i, k in enumerate(keys)
+        }
         xflag = {
             k: torch.as_tensor(
                 i, dtype=torch.int64, device=device
@@ -271,13 +288,21 @@ class SCGLUETrainer(GLUETrainer):
         eidx = eidx.to(device, non_blocking=True)
         ewt = ewt.to(device, non_blocking=True)
         esgn = esgn.to(device, non_blocking=True)
-        return x, xrep, xbch, xlbl, xdwt, xflag, eidx, ewt, esgn
+        if self.net.use_node_attributes:
+            eattr = eattr.to(device, non_blocking=True)
+            return x, xrep, xbch, xlbl, xdwt, xflag, eidx, ewt, esgn, eattr
+        else:
+            return x, xrep, xbch, xlbl, xdwt, xrds, xflag, eidx, ewt, esgn
 
     def compute_losses(
             self, data: DataTensors, epoch: int, dsc_only: bool = False
     ) -> Mapping[str, torch.Tensor]:
+        lam_depth = 0.05
         net = self.net
-        x, xrep, xbch, xlbl, xdwt, xflag, eidx, ewt, esgn = data
+        if self.net.use_node_attributes:
+            x, xrep, xbch, xlbl, xdwt, xflag, eidx, ewt, esgn, eattr = data
+        else:
+            x, xrep, xbch, xlbl, xdwt, xrds, xflag, eidx, ewt, esgn = data
 
         u, l = {}, {}
         for k in net.keys:
@@ -290,16 +315,22 @@ class SCGLUETrainer(GLUETrainer):
         u_cat = torch.cat([u[k].mean for k in net.keys])
         xbch_cat = torch.cat([xbch[k] for k in net.keys])
         xdwt_cat = torch.cat([xdwt[k] for k in net.keys])
+        xrds_cat = torch.cat([xrds[k] for k in net.keys])
+        xrds_weight = torch.cat([torch.ones_like(xrds[k]) if k == 'hic' else torch.zeros_like(xrds[k]) for k in net.keys])
         xflag_cat = torch.cat([xflag[k] for k in net.keys])
         anneal = max(1 - (epoch - 1) / self.align_burnin, 0) \
             if self.align_burnin else 0
         if anneal:
             noise = D.Normal(0, u_cat.std(axis=0)).sample((u_cat.shape[0], ))
             u_cat = u_cat + (anneal * self.BURNIN_NOISE_EXAG) * noise
-        dsc_loss = F.cross_entropy(net.du(u_cat, xbch_cat), xflag_cat, reduction="none")
+        xflag_pred = net.du(u_cat, xbch_cat)
+        dsc_loss = F.cross_entropy(xflag_pred, xflag_cat, reduction="none")
         dsc_loss = (dsc_loss * xdwt_cat).sum() / xdwt_cat.numel()
+        xrds_pred = net.durds(u_cat, xbch_cat)
+        #dsc_rds_loss = F.smooth_l1_loss(xrds_pred, xrds_cat)
+        dsc_rds_loss = F.binary_cross_entropy_with_logits(xrds_pred, xrds_cat, weight=xrds_weight)
         if dsc_only:
-            return {"dsc_loss": self.lam_align * dsc_loss}
+            return {"dsc_loss": self.lam_align * dsc_loss + lam_depth * dsc_rds_loss}
 
         if net.u2c:
             xlbl_cat = torch.cat([xlbl[k] for k in net.keys])
@@ -310,7 +341,10 @@ class SCGLUETrainer(GLUETrainer):
         else:
             sup_loss = torch.tensor(0.0, device=self.net.device)
 
-        v = net.g2v(self.eidx, self.enorm, self.esgn)
+        if self.net.use_node_attributes:
+            v = net.g2v(self.eidx, self.enorm, self.esgn, eattr)
+        else:
+            v = net.g2v(self.eidx, self.enorm, self.esgn)
         vsamp = v.rsample()
 
         g_nll = -net.v2g(vsamp, eidx, esgn).log_prob(ewt)
@@ -323,7 +357,6 @@ class SCGLUETrainer(GLUETrainer):
         g_nll = (g_nll_pn[0] / max(n_neg, 1) + g_nll_pn[1] / max(n_pos, 1)) / avgc
         g_kl = D.kl_divergence(v, prior).sum(dim=1).mean() / vsamp.shape[0]
         g_elbo = g_nll + self.lam_kl * g_kl
-
         x_nll = {
             k: -net.u2x[k](
                 usamp[k], vsamp[getattr(net, f"{k}_idx")], xbch[k], l[k]
@@ -345,10 +378,11 @@ class SCGLUETrainer(GLUETrainer):
         vae_loss = self.lam_data * x_elbo_sum \
             + self.lam_graph * len(net.keys) * g_elbo \
             + self.lam_sup * sup_loss
-        gen_loss = vae_loss - self.lam_align * dsc_loss
+        gen_loss = vae_loss - self.lam_align * dsc_loss - lam_depth * dsc_rds_loss
 
         losses = {
-            "dsc_loss": dsc_loss, "vae_loss": vae_loss, "gen_loss": gen_loss,
+            "dsc_loss": dsc_loss, "dsc_rds_loss": dsc_rds_loss, 
+            "vae_loss": vae_loss, "gen_loss": gen_loss,
             "g_nll": g_nll, "g_kl": g_kl, "g_elbo": g_elbo
         }
         for k in net.keys:
@@ -371,6 +405,7 @@ class SCGLUETrainer(GLUETrainer):
         if self.freeze_u:
             self.net.x2u.apply(freeze_running_stats)
             self.net.du.apply(freeze_running_stats)
+            self.net.durds.apply(freeze_running_stats)
         else:  # Discriminator step
             losses = self.compute_losses(data, epoch, dsc_only=True)
             self.net.zero_grad(set_to_none=True)
@@ -573,7 +608,6 @@ class PairedSCGLUETrainer(SCGLUETrainer):
         g_nll = (g_nll_pn[0] / max(n_neg, 1) + g_nll_pn[1] / max(n_pos, 1)) / avgc
         g_kl = D.kl_divergence(v, prior).sum(dim=1).mean() / vsamp.shape[0]
         g_elbo = g_nll + self.lam_kl * g_kl
-
         x_nll = {
             k: -net.u2x[k](
                 usamp[k], vsamp[getattr(net, f"{k}_idx")], xbch[k], l[k]
@@ -713,13 +747,25 @@ class SCGLUEModel(Model):
             vertices: List[str], latent_dim: int = 50,
             h_depth: int = 2, h_dim: int = 256,
             dropout: float = 0.2, shared_batches: bool = False,
+            use_node_attributes: List[str] = None,
+            use_multi_strata_graph_encoder: bool = False,
+            shifted_additive: bool = False,
+            use_activation: bool = False,
+            use_attn: bool = False,
+            n_strata: int = 5,
             random_seed: int = 0
     ) -> None:
         self.vertices = pd.Index(vertices)
         self.random_seed = random_seed
         torch.manual_seed(self.random_seed)
-
-        g2v = sc.GraphEncoder(self.vertices.size, latent_dim)
+        self.use_node_attributes = use_node_attributes
+        self.node_attr_dim = len(use_node_attributes) if use_node_attributes is not None else 0
+        if use_node_attributes is not None:
+            g2v = sc.GraphEncoderWithNodeAttributes(self.vertices.size, latent_dim, self.node_attr_dim)
+        elif use_multi_strata_graph_encoder:
+            g2v = sc.GraphEncoderMultiStrata(self.vertices.size, latent_dim, n_strata=n_strata)
+        else:
+            g2v = sc.GraphEncoder(self.vertices.size, latent_dim)
         v2g = sc.GraphDecoder()
         self.modalities, idx, x2u, u2x, all_ct = {}, {}, {}, {}, set()
         for k, adata in adatas.items():
@@ -734,20 +780,100 @@ class SCGLUEModel(Model):
                     "It is recommended that `use_rep` dimensionality "
                     "be equal or larger than `latent_dim`."
                 )
-            idx[k] = self.vertices.get_indexer(data_config["features"]).astype(np.int64)
-            if idx[k].min() < 0:
+            if data_config["prob_model"] in ['HiCNB', 'HiCZINB']:
+                feats = []
+                for feat in data_config["features"]:
+                    if feat[-2] != '-':  # non-distal feat
+                        feats.append(feat)
+                idx[k] = self.vertices.get_indexer(feats).astype(np.int64)
+            else:
+                idx[k] = self.vertices.get_indexer(data_config["features"]).astype(np.int64)
+            if idx[k].min() < 0 and data_config["prob_model"] not in ['HiCNB', 'HiCZINB']:  # 2D Hi-C inputs only contain one node per strata
+                print(idx[k])
+                print(k)
+                print(data_config["features"][-1])
+                print(data_config["prob_model"])
+                for i in range(len(data_config["features"])):
+                    if data_config["features"][i] not in self.vertices:
+                        print(i, data_config["features"][i])
+                        break
                 raise ValueError("Not all modality features exist in the graph!")
             idx[k] = torch.as_tensor(idx[k])
-            x2u[k] = _ENCODER_MAP[data_config["prob_model"]](
-                data_config["rep_dim"] or len(data_config["features"]), latent_dim,
-                h_depth=h_depth, h_dim=h_dim, dropout=dropout
-            )
+            
             data_config["batches"] = pd.Index([]) if data_config["batches"] is None \
                 else pd.Index(data_config["batches"])
-            u2x[k] = _DECODER_MAP[data_config["prob_model"]](
-                len(data_config["features"]),
-                n_batches=max(data_config["batches"].size, 1)
-            )
+            if data_config["prob_model"] in ['HiCNB', 'HiCZINB']:
+                strata_masks = []
+                strata_idxs = []
+                feature_masks = []
+                non_distal_indices = []
+                non_distal_feature_indices = []
+                non_distal_idx_map = {}
+                anchor_idx = 0
+                max_chr_idxs = {}  # max bin index for each chromosome (interactions further than the chrom end ar mapped to this)
+                current_chr = None
+                for i in range(len(data_config["features"])):  # non-distal features
+                    if data_config["features"][i][-2] != '-' and data_config["features"][i][-3] != '-':
+                        non_distal_indices.append(i)
+                        non_distal_feature_indices.append(anchor_idx)
+                        non_distal_idx_map[str(data_config["features"][i])] = anchor_idx
+                        anchor_idx += 1
+                        current_chr = data_config["features"][i].split(':')[0]
+                        max_chr_idxs[current_chr] = anchor_idx
+                        
+                print(max_chr_idxs)
+                strata_masks.append(np.array(non_distal_indices))
+                feature_masks.append(np.array(non_distal_feature_indices))
+                for strata_k in range(1, n_strata):
+                    #print(f'-{strata_k}')
+                    distal_indices = []
+                    distal_feature_indices = []
+                    for i in range(len(data_config["features"])):
+                        if data_config["features"][i].endswith(f'-{strata_k}'):
+                            distal_indices.append(i)
+                            feat_name = str(data_config["features"][i])
+                            feat_name = feat_name[:feat_name.rfind(f'-{strata_k}')]
+                            try:
+                                distal_feature_indices.append(non_distal_idx_map[feat_name])
+                            except KeyError as e:
+                                #print(feat_name, e, i, strata_k)
+                                current_chr = feat_name.split(':')[0]
+                                distal_feature_indices.append(max_chr_idxs[current_chr])
+
+                    strata_masks.append(np.array(distal_indices))
+                    feature_masks.append(np.array(distal_feature_indices))
+                #print(feature_masks)
+                # for m in strata_masks:
+                #     print(m.shape)
+                # for m in feature_masks:
+                #     print(m.min(), m.max())
+                x2u[k] = _ENCODER_MAP[data_config["prob_model"]](
+                    data_config["rep_dim"] or len(data_config["features"]), latent_dim,
+                    h_depth=h_depth, h_dim=h_dim, dropout=dropout,
+                    strata_masks=strata_masks,
+                    downsample_min=0.5, downsample_max=0.9
+                )
+                u2x[k] = _DECODER_MAP[data_config["prob_model"]](
+                    len(data_config["features"]),
+                    n_batches=max(data_config["batches"].size, 1),
+                    n_nodes=len(idx[k]),
+                    input_dim=n_strata,
+                    embedding_size=latent_dim,
+                    feature_masks=feature_masks,
+                    strata_masks=strata_masks,
+                    shifted_additive=shifted_additive,
+                    use_activation=use_activation,
+                    use_attn=use_attn
+                )
+            else:
+                x2u[k] = _ENCODER_MAP[data_config["prob_model"]](
+                    data_config["rep_dim"] or len(data_config["features"]), latent_dim,
+                    h_depth=h_depth, h_dim=h_dim, dropout=dropout
+                )
+                u2x[k] = _DECODER_MAP[data_config["prob_model"]](
+                    len(data_config["features"]),
+                    n_batches=max(data_config["batches"].size, 1)
+                )
             all_ct = all_ct.union(
                 set() if data_config["cell_types"] is None
                 else data_config["cell_types"]
@@ -769,10 +895,16 @@ class SCGLUEModel(Model):
             latent_dim, len(self.modalities), n_batches=du_n_batches,
             h_depth=h_depth, h_dim=h_dim, dropout=dropout
         )
+        durds = sc.Discriminator(
+            latent_dim, 1, n_batches=du_n_batches,
+            h_depth=h_depth, h_dim=h_dim, dropout=dropout
+        )
         prior = sc.Prior()
         super().__init__(
             g2v, v2g, x2u, u2x, idx, du, prior,
-            u2c=None if all_ct.empty else sc.Classifier(latent_dim, all_ct.size)
+            u2c=None if all_ct.empty else sc.Classifier(latent_dim, all_ct.size),
+            durds=durds,
+            use_node_attributes=use_node_attributes
         )
 
     def freeze_cells(self) -> None:
@@ -871,7 +1003,8 @@ class SCGLUEModel(Model):
             align_burnin: int = AUTO, safe_burnin: bool = True,
             max_epochs: int = AUTO, patience: Optional[int] = AUTO,
             reduce_lr_patience: Optional[int] = AUTO,
-            wait_n_lrs: int = 1, directory: Optional[os.PathLike] = None
+            wait_n_lrs: int = 1, directory: Optional[os.PathLike] = None,
+            plugins: Optional[Mapping[str, ignite.engine.Engine]] = None
     ) -> None:
         r"""
         Fit model on given datasets
@@ -915,10 +1048,17 @@ class SCGLUEModel(Model):
             graph, adatas.values(),
             cov="ignore", attr="error", loop="warn", sym="warn"
         )
-        graph = GraphDataset(
-            graph, self.vertices, neg_samples=neg_samples,
-            weighted_sampling=True, deemphasize_loops=True
-        )
+        if self.use_node_attributes:
+            graph = GraphDatasetWithAttr(
+                graph, self.vertices, neg_samples=neg_samples,
+                weighted_sampling=True, deemphasize_loops=True,
+                use_node_attributes=self.use_node_attributes
+            )
+        else:
+            graph = GraphDataset(
+                graph, self.vertices, neg_samples=neg_samples,
+                weighted_sampling=True, deemphasize_loops=True,
+            )
 
         batch_per_epoch = data.size * (1 - val_split) / data_batch_size
         if graph_batch_size == AUTO:
@@ -959,7 +1099,7 @@ class SCGLUEModel(Model):
             max_epochs=max_epochs, patience=patience,
             reduce_lr_patience=reduce_lr_patience, wait_n_lrs=wait_n_lrs,
             random_seed=self.random_seed,
-            directory=directory
+            directory=directory, plugins=plugins
         )
 
     @torch.no_grad()
@@ -994,12 +1134,21 @@ class SCGLUEModel(Model):
             [self.modalities[key] for key in self.net.keys],
             mode="train"
         )
-        graph = GraphDataset(
-            graph, self.vertices,
-            neg_samples=neg_samples,
-            weighted_sampling=True,
-            deemphasize_loops=True
-        )
+        if self.use_node_attributes:
+            graph = GraphDatasetWithAttr(
+                graph, self.vertices,
+                neg_samples=neg_samples,
+                weighted_sampling=True,
+                deemphasize_loops=True,
+                use_node_attributes=self.use_node_attributes
+            )
+        else:
+            graph = GraphDataset(
+                graph, self.vertices,
+                neg_samples=neg_samples,
+                weighted_sampling=True,
+                deemphasize_loops=True
+            )
         if graph_batch_size == AUTO:
             graph_batch_size = ceil(graph.size / self.GRAPH_BATCHES)
             self.logger.info("Setting `graph_batch_size` = %d", graph_batch_size)
@@ -1034,7 +1183,10 @@ class SCGLUEModel(Model):
             if ``n_sample`` is not ``None``.
         """
         self.net.eval()
-        graph = GraphDataset(graph, self.vertices)
+        if self.use_node_attributes:
+            graph = GraphDatasetWithAttr(graph, self.vertices, use_node_attributes=self.use_node_attributes)
+        else:
+            graph = GraphDataset(graph, self.vertices)
         enorm = torch.as_tensor(
             normalize_edges(graph.eidx, graph.ewt),
             device=self.net.device

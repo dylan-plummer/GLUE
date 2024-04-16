@@ -401,7 +401,7 @@ class AnnDataset(Dataset):
     def _extract_data(self, data_configs: List[DATA_CONFIG]) -> Tuple[
             List[pd.Index], Tuple[
                 List[AnyArray], List[AnyArray], List[AnyArray],
-                List[AnyArray], List[AnyArray]
+                List[AnyArray], List[AnyArray], List[AnyArray]
             ]
     ]:
         if self.mode == "eval":
@@ -411,7 +411,7 @@ class AnnDataset(Dataset):
     def _extract_data_train(self, data_configs: List[DATA_CONFIG]) -> Tuple[
             List[pd.Index], Tuple[
                 List[AnyArray], List[AnyArray], List[AnyArray],
-                List[AnyArray], List[AnyArray]
+                List[AnyArray], List[AnyArray], List[AnyArray]
             ]
     ]:
         xuid = [
@@ -438,12 +438,16 @@ class AnnDataset(Dataset):
             self._extract_xdwt(adata, data_config)
             for adata, data_config in zip(self.adatas, data_configs)
         ]
-        return xuid, (x, xrep, xbch, xlbl, xdwt)
+        xrds = [
+            self._extract_xrds(adata, data_config)
+            for adata, data_config in zip(self.adatas, data_configs)
+        ]
+        return xuid, (x, xrep, xbch, xlbl, xdwt, xrds)
 
     def _extract_data_eval(self, data_configs: List[DATA_CONFIG]) -> Tuple[
             List[pd.Index], Tuple[
                 List[AnyArray], List[AnyArray], List[AnyArray],
-                List[AnyArray], List[AnyArray]
+                List[AnyArray], List[AnyArray], List[AnyArray]
             ]
     ]:
         default_dtype = get_default_numpy_dtype()
@@ -468,7 +472,11 @@ class AnnDataset(Dataset):
             np.empty((adata.shape[0], 0), dtype=default_dtype)
             for adata in self.adatas
         ]
-        return xuid, (x, xrep, xbch, xlbl, xdwt)
+        xrds = [
+            np.empty((adata.shape[0], 0), dtype=float)
+            for adata in self.adatas
+        ]
+        return xuid, (x, xrep, xbch, xlbl, xdwt, xrds)
 
     def _extract_x(self, adata: AnnData, data_config: DATA_CONFIG) -> AnyArray:
         default_dtype = get_default_numpy_dtype()
@@ -553,6 +561,17 @@ class AnnDataset(Dataset):
         else:
             xdwt = np.ones(adata.shape[0], dtype=default_dtype)
         return xdwt
+    
+    def _extract_xrds(self, adata: AnnData, data_config: DATA_CONFIG) -> AnyArray:  # read depth sparsity
+        use_batch = data_config["use_depth"]
+        if use_batch:
+            if use_batch not in adata.obs:
+                raise ValueError(
+                    f"Configured data batch '{use_batch}' "
+                    f"cannot be found in input data!"
+                )
+            return np.expand_dims(adata.obs[use_batch].to_numpy(), -1)
+        return np.zeros((adata.shape[0], 1), dtype=float)
 
     def _extract_xuid(self, adata: AnnData, data_config: DATA_CONFIG) -> pd.Index:
         if data_config["use_obs_names"]:
@@ -608,6 +627,186 @@ class AnnDataset(Dataset):
             sub.shuffle_idx, sub.shuffle_pmsk = sub._get_idx_pmsk(idx)  # pylint: disable=protected-access
             subdatasets.append(sub)
         return subdatasets
+    
+
+@logged
+class GraphDatasetWithAttr(Dataset):
+
+    r"""
+    Dataset for graphs with support for negative sampling
+
+    Parameters
+    ----------
+    graph
+        Graph object
+    vertices
+        Indexer of graph vertices
+    neg_samples
+        Number of negative samples per edge
+    weighted_sampling
+        Whether to do negative sampling based on vertex importance
+    deemphasize_loops
+        Whether to deemphasize self-loops when computing vertex importance
+    getitem_size
+        Unitary fetch size for each __getitem__ call
+
+    Note
+    ----
+    Custom shuffling performs negative sampling.
+    """
+
+    def __init__(
+            self, graph: nx.Graph, vertices: pd.Index,
+            neg_samples: int = 1, weighted_sampling: bool = True,
+            deemphasize_loops: bool = True, getitem_size: int = 1,
+            use_node_attributes: List[str] = ['seq_pc_0']
+    ) -> None:
+        super().__init__(getitem_size=getitem_size)
+        self.use_node_attributes = use_node_attributes
+        self.eidx, self.ewt, self.esgn = \
+            self.graph2triplet(graph, vertices)
+        self.eset = {
+            (i, j, s) for (i, j), s in
+            zip(self.eidx.T, self.esgn)
+        }
+        
+        self.vnum = self.eidx.max() + 1
+        if weighted_sampling:
+            if deemphasize_loops:
+                non_loop = self.eidx[0] != self.eidx[1]
+                eidx = self.eidx[:, non_loop]
+                ewt = self.ewt[non_loop]
+            else:
+                eidx = self.eidx
+                ewt = self.ewt
+            degree = vertex_degrees(eidx, ewt, vnum=self.vnum, direction="both")
+        else:
+            degree = np.ones(self.vnum, dtype=self.ewt.dtype)
+        degree_sum = degree.sum()
+        if degree_sum:
+            self.vprob = degree / degree_sum  # Vertex sampling probability
+        else:  # Possible when `deemphasize_loops` is set on a loop-only graph
+            self.vprob = np.ones(self.vnum, dtype=self.ewt.dtype) / self.vnum
+
+        effective_enum = self.ewt.sum()
+        self.eprob = self.ewt / effective_enum  # Edge sampling probability
+        self.effective_enum = round(effective_enum)
+
+        self.neg_samples = neg_samples
+        self.size = self.effective_enum * (1 + self.neg_samples)
+        self.samp_eidx: Optional[np.ndarray] = None
+        self.samp_ewt: Optional[np.ndarray] = None
+        self.samp_esgn: Optional[np.ndarray] = None
+
+    def graph2triplet(
+            self, graph: nx.Graph, vertices: pd.Index,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        r"""
+        Convert graph object to graph triplet
+
+        Parameters
+        ----------
+        graph
+            Graph object
+        vertices
+            Graph vertices
+
+        Returns
+        -------
+        eidx
+            Vertex indices of edges (:math:`2 \times n_{edges}`)
+        ewt
+            Weight of edges (:math:`n_{edges}`)
+        esgn
+            Sign of edges (:math:`n_{edges}`)
+        """
+        graph = nx.MultiDiGraph(graph)  # Convert undirecitonal to bidirectional, while keeping multi-edges
+        self.node_attr_mat = []
+        for node_attr in self.use_node_attributes:
+            attr_dict = nx.get_node_attributes(graph, node_attr)
+            attr_arr = []
+            for n in vertices:
+                try:
+                    attr_arr.append(attr_dict[n])
+                except KeyError:
+                    attr_arr.append(0)
+            attr_arr = np.array(attr_arr)
+            self.node_attr_mat.append(attr_arr)
+        default_dtype = get_default_numpy_dtype()
+        self.node_attr_mat = np.stack(self.node_attr_mat, axis=1)
+        self.node_attr_mat = np.asarray(self.node_attr_mat).astype(default_dtype)
+        print(self.node_attr_mat.shape)
+        print(np.mean(self.node_attr_mat, axis=0))
+        
+        i, j, w, s, a = [], [], [], [], []
+        for k, v in dict(graph.edges).items():
+            i.append(k[0])
+            j.append(k[1])
+            w.append(v["weight"])
+            s.append(v["sign"])
+        eidx = np.stack([
+            vertices.get_indexer(i),
+            vertices.get_indexer(j)
+        ]).astype(np.int64)
+        if eidx.min() < 0:
+            raise ValueError("Missing vertices!")
+        ewt = np.asarray(w).astype(default_dtype)
+        if ewt.min() <= 0 or ewt.max() > 1:
+            raise ValueError("Invalid edge weight!")
+        esgn = np.asarray(s).astype(default_dtype)
+        if set(esgn).difference({-1, 1}):
+            raise ValueError("Invalid edge sign!")
+        return eidx, ewt, esgn
+
+    def __len__(self) -> int:
+        return ceil(self.size / self.getitem_size)
+
+    def __getitem__(self, index: int) -> List[torch.Tensor]:
+        s = slice(
+            index * self.getitem_size,
+            min((index + 1) * self.getitem_size, self.size)
+        )
+        return [
+            torch.as_tensor(self.samp_eidx[:, s]),
+            torch.as_tensor(self.samp_ewt[s]),
+            torch.as_tensor(self.samp_esgn[s]),
+            torch.as_tensor(self.node_attr_mat)
+        ]
+
+    def propose_shuffle(
+            self, seed: int
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        (pi, pj), pw, ps = self.eidx, self.ewt, self.esgn
+        rs = get_rs(seed)
+        psamp = rs.choice(self.ewt.size, self.effective_enum, replace=True, p=self.eprob)
+        pi_, pj_, pw_, ps_ = pi[psamp], pj[psamp], pw[psamp], ps[psamp]
+        pw_ = np.ones_like(pw_)
+        ni_ = np.tile(pi_, self.neg_samples)
+        nw_ = np.zeros(pw_.size * self.neg_samples, dtype=pw_.dtype)
+        ns_ = np.tile(ps_, self.neg_samples)
+        nj_ = rs.choice(self.vnum, pj_.size * self.neg_samples, replace=True, p=self.vprob)
+
+        remain = np.where([
+            item in self.eset
+            for item in zip(ni_, nj_, ns_)
+        ])[0]
+        while remain.size:  # NOTE: Potential infinite loop if graph too dense
+            newnj = rs.choice(self.vnum, remain.size, replace=True, p=self.vprob)
+            nj_[remain] = newnj
+            remain = remain[[
+                item in self.eset
+                for item in zip(ni_[remain], newnj, ns_[remain])
+            ]]
+        idx = np.stack([np.concatenate([pi_, ni_]), np.concatenate([pj_, nj_])])
+        w = np.concatenate([pw_, nw_])
+        s = np.concatenate([ps_, ns_])
+        perm = rs.permutation(idx.shape[1])
+        return idx[:, perm], w[perm], s[perm]
+
+    def accept_shuffle(
+            self, shuffled: Tuple[np.ndarray, np.ndarray, np.ndarray]
+    ) -> None:
+        self.samp_eidx, self.samp_ewt, self.samp_esgn = shuffled
 
 
 @logged
@@ -783,10 +982,12 @@ class DataLoader(torch.utils.data.DataLoader):
 
     def __init__(self, dataset: Dataset, **kwargs) -> None:
         super().__init__(dataset, **kwargs)
-        self.collate_fn = self._collate_graph if isinstance(
+        self.use_node_attributes = isinstance(dataset, GraphDatasetWithAttr)
+        self.collate_fn = self._collate_graph(self.use_node_attributes) if (isinstance(
             dataset, GraphDataset
-        ) else self._collate
+        ) or isinstance(dataset, GraphDatasetWithAttr)) else self._collate
         self.shuffle = kwargs["shuffle"] if "shuffle" in kwargs else False
+        
 
     def __iter__(self) -> "DataLoader":
         if self.shuffle:
@@ -798,12 +999,22 @@ class DataLoader(torch.utils.data.DataLoader):
         return tuple(map(lambda x: torch.cat(x, dim=0), zip(*batch)))
 
     @staticmethod
-    def _collate_graph(batch):
-        eidx, ewt, esgn = zip(*batch)
-        eidx = torch.cat(eidx, dim=1)
-        ewt = torch.cat(ewt, dim=0)
-        esgn = torch.cat(esgn, dim=0)
-        return eidx, ewt, esgn
+    def _collate_graph(use_node_attributes):
+        def f(batch):
+            if use_node_attributes:
+                eidx, ewt, esgn, node_attr = zip(*batch)
+                eidx = torch.cat(eidx, dim=1)
+                ewt = torch.cat(ewt, dim=0)
+                esgn = torch.cat(esgn, dim=0)
+                node_attr = node_attr[0]  # always just use all the node attributes
+                return eidx, ewt, esgn, node_attr
+            else:
+                eidx, ewt, esgn = zip(*batch)
+                eidx = torch.cat(eidx, dim=1)
+                ewt = torch.cat(ewt, dim=0)
+                esgn = torch.cat(esgn, dim=0)
+                return eidx, ewt, esgn
+        return f
 
 
 class ParallelDataLoader:

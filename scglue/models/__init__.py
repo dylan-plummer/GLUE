@@ -20,7 +20,10 @@ from .dx import integration_consistency
 from .nn import autodevice
 from .scclue import SCCLUEModel
 from .scglue import PairedSCGLUEModel, SCGLUEModel
+from .plugins import EmbeddingVisualizer
 
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 @logged
 def configure_dataset(
@@ -29,6 +32,7 @@ def configure_dataset(
         use_layer: Optional[str] = None,
         use_rep: Optional[str] = None,
         use_batch: Optional[str] = None,
+        use_depth: Optional[str] = None,
         use_cell_type: Optional[str] = None,
         use_dsc_weight: Optional[str] = None,
         use_obs_names: bool = False
@@ -104,6 +108,13 @@ def configure_dataset(
     else:
         data_config["use_batch"] = None
         data_config["batches"] = None
+    if use_depth:
+        if use_depth not in adata.obs:
+            raise ValueError("Invalid `use_depth`!")
+        data_config["use_depth"] = use_depth
+    else:
+        data_config["use_depth"] = None 
+
     if use_cell_type:
         if use_cell_type not in adata.obs:
             raise ValueError("Invalid `use_cell_type`!")
@@ -150,7 +161,7 @@ def load_model(fname: os.PathLike) -> Model:
 def fit_SCGLUE(
         adatas: Mapping[str, AnnData], graph: nx.Graph, model: type = SCGLUEModel,
         init_kws: Kws = None, compile_kws: Kws = None, fit_kws: Kws = None,
-        balance_kws: Kws = None
+        balance_kws: Kws = None, log_wandb: bool = False
 ) -> SCGLUEModel:
     r"""
     Fit GLUE model to integrate single-cell multi-omics data
@@ -202,8 +213,33 @@ def fit_SCGLUE(
             os.path.join(pretrain_fit_kws["directory"], "pretrain")
 
     pretrain = model(adatas, sorted(graph.nodes), **pretrain_init_kws)
+    n_params = count_parameters(pretrain.net)
+    fit_SCGLUE.logger.info(f"Number of trainable parameters: {int(n_params / 1e6)}M")
     pretrain.compile(**compile_kws)
-    pretrain.fit(adatas, graph, **pretrain_fit_kws)
+    if log_wandb:
+        import wandb
+        wandb.watch(pretrain.net, log_freq=100, log="all")
+    type_dict = dict(graph.nodes(data='feature_type', default='n/a'))
+    chrom_dict = dict(graph.nodes(data='chrom', default='n/a'))
+    weight_dict = dict(graph.nodes(data='chrom_pos', default=1.0))
+    node_attr_df = {'type': [], 'chrom': [], 'pos': [], 'degree': []}
+    for node in sorted(graph.nodes):
+        node_attr_df['type'].append(type_dict[node])
+        node_attr_df['chrom'].append(chrom_dict[node])
+        node_attr_df['pos'].append(weight_dict[node])
+        node_attr_df['degree'].append(graph.degree[node])
+    node_attr_df = pd.DataFrame(node_attr_df, index=sorted(graph.nodes))
+    print(node_attr_df)
+    # create anndata for node attributes using g2v.vrepr as init X
+    node_attr_anndata = AnnData(pretrain.net.g2v.vrepr.cpu().detach().numpy(), obs=node_attr_df)
+    print(node_attr_anndata)
+    embedding_viz = EmbeddingVisualizer(adatas['rna'], pretrain.modalities['rna'],
+                                        adatas['hic'], pretrain.modalities['hic'], 
+                                        graph, sorted(graph.nodes),
+                                        node_attr_anndata,
+                                        latent_dim=init_kws['latent_dim'],
+                                        prefix='pretrain')
+    pretrain.fit(adatas, graph, **pretrain_fit_kws, plugins=[embedding_viz])
     if "directory" in pretrain_fit_kws:
         pretrain.save(os.path.join(pretrain_fit_kws["directory"], "pretrain.dill"))
 
@@ -235,9 +271,19 @@ def fit_SCGLUE(
     finetune = model(adatas, sorted(graph.nodes), **init_kws)
     finetune.adopt_pretrained_model(pretrain)
     finetune.compile(**compile_kws)
+    if log_wandb:
+        import wandb
+        wandb.watch(pretrain.net, log_freq=100, log="all")
     fit_SCGLUE.logger.debug("Increasing random seed by 1 to prevent idential data order...")
     finetune.random_seed += 1
-    finetune.fit(adatas, graph, **finetune_fit_kws)
+    node_attr_anndata = AnnData(pretrain.net.g2v.vrepr.cpu().detach().numpy(), obs=node_attr_df)
+    print(node_attr_anndata)
+    embedding_viz = EmbeddingVisualizer(adatas['rna'], pretrain.modalities['rna'],
+                                        adatas['hic'], pretrain.modalities['hic'],
+                                        graph, sorted(graph.nodes), 
+                                        node_attr_anndata,
+                                        prefix='finetune')
+    finetune.fit(adatas, graph, **finetune_fit_kws, plugins=[embedding_viz])
     if "directory" in finetune_fit_kws:
         finetune.save(os.path.join(finetune_fit_kws["directory"], "fine-tune.dill"))
 

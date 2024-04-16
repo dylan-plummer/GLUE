@@ -290,6 +290,7 @@ class GLUETrainer(Trainer):
     def __init__(
             self, net: GLUE, lam_data: float = None, lam_kl: float = None,
             lam_graph: float = None, lam_align: float = None,
+            lam_rds: float = None,
             modality_weight: Mapping[str, float] = None,
             optim: str = None, lr: float = None, **kwargs
     ) -> None:
@@ -312,6 +313,7 @@ class GLUETrainer(Trainer):
         self.lam_kl = lam_kl
         self.lam_graph = lam_graph
         self.lam_align = lam_align
+        self.lam_rds = lam_rds
         if min(modality_weight.values()) < 0:
             raise ValueError("Modality weight must be non-negative!")
         normalizer = sum(modality_weight.values()) / len(modality_weight)
@@ -326,9 +328,18 @@ class GLUETrainer(Trainer):
                 self.net.u2x.parameters()
             ), lr=self.lr, **kwargs
         )
-        self.dsc_optim = getattr(torch.optim, optim)(
-            self.net.du.parameters(), lr=self.lr, **kwargs
-        )
+        if self.net.durds:
+            self.dsc_optim = getattr(torch.optim, optim)(
+                itertools.chain(
+                    self.net.du.parameters(), 
+                    self.net.durds.parameters()
+                ), lr=self.lr, **kwargs
+            )
+        else:
+            self.dsc_optim = getattr(torch.optim, optim)(
+                self.net.du.parameters(),
+                lr=self.lr, **kwargs
+            )
 
         self.align_burnin: Optional[int] = None
         self.eidx: Optional[torch.Tensor] = None  # Full graph used by the graph encoder
