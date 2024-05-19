@@ -21,15 +21,16 @@ import scanpy as sc
 import seaborn as sns
 import matplotlib.pyplot as plt
 from adjustText import adjust_text
+from scipy.stats import pearsonr
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans, AgglomerativeClustering
-from sklearn.metrics import adjusted_rand_score, accuracy_score, balanced_accuracy_score, confusion_matrix, f1_score
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.metrics import adjusted_rand_score, accuracy_score, balanced_accuracy_score, confusion_matrix, f1_score, silhouette_score
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 
 from ..utils import config, logged
 from ..num import normalize_edges
 from .base import Trainer, TrainingPlugin
-from .data import AnnDataset, DataLoader, GraphDataset
+from .data import AnnDataset, DataLoader, GraphDataset, ArrayDataset
 from ..data import transfer_labels
 
 EPOCH_COMPLETED = ignite.engine.Events.EPOCH_COMPLETED
@@ -211,8 +212,12 @@ class LRScheduler(TrainingPlugin):
         self.monitor = monitor
         if patience is None:
             raise ValueError("`patience` must be specified!")
+        # self.schedulers = [
+        #     ReduceLROnPlateau(optim, patience=patience, verbose=True)
+        #     for optim in optims
+        # ]
         self.schedulers = [
-            ReduceLROnPlateau(optim, patience=patience, verbose=True)
+            CosineAnnealingWarmRestarts(optim, T_0=patience, T_mult=2, verbose=True)
             for optim in optims
         ]
         self.burnin = burnin
@@ -236,7 +241,8 @@ class LRScheduler(TrainingPlugin):
             update_flags = set()
             for scheduler in self.schedulers:
                 old_lr = scheduler.optimizer.param_groups[0]["lr"]
-                scheduler.step(score_engine.state.metrics[self.monitor])
+                #scheduler.step(score_engine.state.metrics[self.monitor])
+                scheduler.step()
                 new_lr = scheduler.optimizer.param_groups[0]["lr"]
                 update_flags.add(new_lr != old_lr)
             if len(update_flags) != 1:
@@ -355,6 +361,58 @@ class EmbeddingVisualizer(TrainingPlugin):
                 v = net.g2v(eidx, enorm, esgn)
                 self.features_ad.X = v.mean.detach().cpu().numpy()
 
+                # decode data
+                l = 1.0
+                if not isinstance(l, np.ndarray):
+                    l = np.asarray(l)
+                l = l.squeeze()
+                if l.ndim == 0:  # Scalar
+                    l = l[np.newaxis]
+                elif l.ndim > 1:
+                    raise ValueError("`target_libsize` cannot be >1 dimensional")
+                if l.size == 1:
+                    l_rna = np.repeat(l, self.rna.shape[0])
+                    l_hic = np.repeat(l, self.hic.shape[0])
+       
+                l_rna = l_rna.reshape((-1, 1))
+                l_hic = l_hic.reshape((-1, 1))
+                b_rna = np.zeros(self.rna.shape[0], dtype=int)
+                b_hic = np.zeros(self.hic.shape[0], dtype=int)
+                v = torch.as_tensor(self.features_ad.X, device=net.device)
+                v_hic = v[getattr(net, "hic_idx")]
+                v_rna = v[getattr(net, "rna_idx")]
+                data = ArrayDataset(self.hic.obsm['X_glue'], b_hic, l_hic, getitem_size=128)
+                data_loader = DataLoader(
+                    data, batch_size=1, shuffle=False,
+                    num_workers=config.DATALOADER_NUM_WORKERS,
+                    pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
+                    persistent_workers=False
+                )
+                hic_pred_rna = []
+                for u_, b_, l_ in data_loader:
+                    u_ = u_.to(net.device, non_blocking=True)
+                    b_ = b_.to(net.device, non_blocking=True)
+                    l_ = l_.to(net.device, non_blocking=True)
+                    hic_pred_rna.append(net.u2x['rna'](u_, v_rna, b_, l_).mean.detach().cpu())
+                hic_pred_rna = torch.cat(hic_pred_rna).numpy()
+                self.hic.obsm['X_pred_rna'] = hic_pred_rna
+
+                data = ArrayDataset(self.rna.obsm['X_glue'], b_rna, l_rna, getitem_size=128)
+                data_loader = DataLoader(
+                    data, batch_size=1, shuffle=False,
+                    num_workers=config.DATALOADER_NUM_WORKERS,
+                    pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
+                    persistent_workers=False
+                )
+                rna_pred_rna = []
+                for u_, b_, l_ in data_loader:
+                    u_ = u_.to(net.device, non_blocking=True)
+                    b_ = b_.to(net.device, non_blocking=True)
+                    l_ = l_.to(net.device, non_blocking=True)
+                    rna_pred_rna.append(net.u2x['rna'](u_, v_rna, b_, l_).mean.detach().cpu())
+                rna_pred_rna = torch.cat(rna_pred_rna).numpy()
+                self.rna.obsm['X_pred_rna'] = rna_pred_rna
+
                 net.train()
 
                 # visualize some params
@@ -432,11 +490,18 @@ class EmbeddingVisualizer(TrainingPlugin):
                 # plot a few neighborhood examples
                 # example_genes = ['GAD1', 'INS', 'GCG', 'CEL', 'LOXL4', 'WFS1', 'PPY', 'EPSTI1', 'PPARG', 'ANK1', 'TSPAN8', 'LPP',
                 #                  'OTUD3', 'LRRTM3', 'BAACL', 'SLC14A1', 'ARNTL2', 'IRX2']
-                example_genes = ['NR2F1', 'CNTN4', 'SYT1', 'GAD1']
+                if 'Alpha' in self.hic.obs['celltype'].unique() or 'Beta' in self.hic.obs['celltype'].unique():
+                    example_genes = ['INS', 'GCG', 'CEL', 'LOXL4', 'WFS1']
+                else:
+                    example_genes = ['NR2F1', 'CNTN4', 'SYT1', 'GAD1', 'GAD2']
+                    example_genes = ['GAD2']
                 graph_out_dir = f'{self.out_dir}/loop_graph'
                 for g in example_genes:
                     if g not in self.vertices:
-                        continue
+                        if g.lower().capitalize() not in self.vertices:
+                            continue
+                        else:
+                            g = g.lower().capitalize()
                     gene_out_dir = f'{graph_out_dir}/{g}'
                     gene_graph_dir = f'{gene_out_dir}/graph'
                     gene_out_dir_pca = f'{gene_out_dir}/pca'
@@ -447,7 +512,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                     gene_neighborhood = [g]
                     bin_idx = get_closest_peak_to_gene(g, self.rna, self.hic.var)
                     n_strata = len(net.u2x['hic'].key_convs)
-                    for k in range(n_strata):
+                    for k in range(n_strata + 1):
                         gene_neighborhood.append(self.hic.var.iloc[bin_idx + k].name)
                         gene_neighborhood.append(self.hic.var.iloc[bin_idx - k].name)
                     for node in self.graph.neighbors(g):
@@ -502,14 +567,21 @@ class EmbeddingVisualizer(TrainingPlugin):
                     n_strata = len(net.u2x['hic'].key_convs)
                     neighborhood_ad.obs['strata'] = 0
                     per_strata_ads = [neighborhood_ad]
+                    attn_mats = []
                     for k in range(n_strata):
                         # get only hi-c features
                         strata_ad = self.features_ad[self.features_ad.obs['type'] == 'Hi-C', :].copy()
                         strata_ad_mask = strata_ad.obs.index.isin(neighborhood_ad.obs.index)
                         v = strata_ad.X
                         v = torch.as_tensor(v, device=net.device)
-                        key_conv = net.u2x['hic'].key_convs[k]
-                        feats = key_conv(v.t()).t()
+                        #key_conv = net.u2x['hic'].key_convs[k]
+                        v = net.u2x['hic'].prenorm_layers[k](v)
+                        qk = net.u2x['hic'].key_layers[k](v)
+                        v = net.u2x['hic'].value_layers[k](v)
+                        feats = net.u2x['hic'].attn_layers[k](qk, qk, v)
+                        attn_mat = torch.matmul(qk[strata_ad_mask, :], qk[strata_ad_mask, :].T) / math.sqrt(qk[strata_ad_mask, :].shape[1])
+                        attn_mats.append(attn_mat.detach().cpu().numpy())
+                        #feats = key_conv(v.t()).t()
                         strata_ad.X = feats.detach().cpu().numpy()
                         strata_ad.obs['strata'] = k + 1
                         strata_ad.obs['type'] = 'Hi-C_strata'
@@ -517,9 +589,51 @@ class EmbeddingVisualizer(TrainingPlugin):
                     per_strata_ad = ad.concat(per_strata_ads)
                     x_pca = PCA(n_components=2).fit_transform(per_strata_ad.X)
                     per_strata_ad.obsm['X_pca'] = x_pca
-                    #sc.set_figure_params()
+                    sc.set_figure_params()
                     fig = sc.pl.pca(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
                     fig.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_pca_features_{save_i}.png')
+                    plt.close()
+
+                    # plot attention maps
+                    attn_out_dir = f'{gene_out_dir}/attn'
+                    os.makedirs(attn_out_dir, exist_ok=True)
+                    mean_attn = np.mean(attn_mats, axis=0)
+                    std_mat = np.std(attn_mats, axis=0)
+                    strata_mat = np.argmax(attn_mats, axis=0)
+                    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                    sns.heatmap(mean_attn, ax=axs[0], cmap='bwr', square=True, cbar=True, center=0)
+                    axs[0].grid(False)
+                    axs[0].set_xticks([])
+                    axs[0].set_yticks([])
+                    axs[0].set_title('Mean Attention')
+                    sns.heatmap(std_mat, ax=axs[1], cmap='Reds', square=True, cbar=True)
+                    axs[1].grid(False)
+                    axs[1].set_xticks([])
+                    axs[1].set_yticks([])
+                    axs[1].set_title('Std Attention')
+                    sns.heatmap(strata_mat, ax=axs[2], cmap='jet', square=True, cbar=True, vmin=0, vmax=n_strata)
+                    axs[2].grid(False)
+                    axs[2].set_xticks([])
+                    axs[2].set_yticks([])
+                    axs[2].set_title('Strata')
+
+                    plt.savefig(f'{attn_out_dir}/{self.prefix}_mean_attn_{g}_{save_i}.png')
+                    plt.close()
+
+                    n_rows = 4
+                    n_cols = int(n_strata // n_rows) + 1
+                    fig, ax = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 5))
+                    #sns.heatmap(mean_attn, ax=ax, cmap='Spectral_r', square=True, cbar=True, center=0)
+                    for i in range(n_strata):
+                        attn_mat = attn_mats[i]
+                        row = i // n_cols
+                        col = i % n_cols
+                        sns.heatmap(attn_mat, ax=ax[row, col], cmap='bwr', square=True, cbar=True, center=0)
+                        ax[row, col].set_title(f'Strata {i + 1}')
+                        ax[row, col].grid(False)
+                        ax[row, col].set_xticks([])
+                        ax[row, col].set_yticks([])
+                    plt.savefig(f'{attn_out_dir}/{self.prefix}_attn_{g}_{save_i}.png')
                     plt.close()
 
                     ax = sc.pl.pca(per_strata_ad, color=["type"], show=False)
@@ -540,121 +654,25 @@ class EmbeddingVisualizer(TrainingPlugin):
                         arrowprops=dict(arrowstyle="->", color="gray", lw=1),
                         ax=ax,
                     )
-                    plt.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_labeled_pca_features_{save_i}.png')
-                    plt.close()
-                    # try:
-                    #     sc.pp.neighbors(per_strata_ad)
-                    #     # sc.tl.draw_graph(per_strata_ad, layout='kk')
-                    #     # fig = sc.pl.draw_graph(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet', edges=True, )
-                    #     # fig.savefig(f'{per_strata_out_dir_graph}/{self.prefix}_graph_features_{save_i}.png')
-                    #     # plt.close()
+                    # plt.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_labeled_pca_features_{save_i}.png')
+                    # plt.close()
+                    try:
+                        sc.pp.neighbors(per_strata_ad)
+                        # sc.tl.draw_graph(per_strata_ad, layout='kk')
+                        # fig = sc.pl.draw_graph(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet', edges=True, )
+                        # fig.savefig(f'{per_strata_out_dir_graph}/{self.prefix}_graph_features_{save_i}.png')
+                        # plt.close()
 
-                    #     sc.tl.umap(per_strata_ad)
-                    #     fig = sc.pl.umap(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
-                    #     fig.savefig(f'{per_strata_out_dir_umap}/{self.prefix}_umap_features_{save_i}.png')
-                    #     plt.close()
-                    # except Exception as e:
-                    #     print(e)
-                    #     pass
+                        sc.tl.umap(per_strata_ad)
+                        fig = sc.pl.umap(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
+                        fig.savefig(f'{per_strata_out_dir_umap}/{self.prefix}_umap_features_{save_i}.png')
+                        plt.close()
+                    except Exception as e:
+                        print(e)
+                        pass
 
 
 
-                #now plot the transformed features at each strata
-                # n_strata = len(net.u2x['hic'].key_convs)
-                # per_strata_ads = []
-                
-                # for k in range(n_strata):
-                #     # get only hi-c features
-                #     strata_ad = self.features_ad[self.features_ad.obs['type'] == 'Hi-C', :].copy()
-                #     v = strata_ad.X
-                #     v = torch.as_tensor(v, device=net.device)
-                #     key_conv = net.u2x['hic'].key_convs[k]
-                #     #qk = net.u2x['hic'].key_layers[k](v)
-                #     #v = self.strata_attn(qk, qk, v)
-                #     #v = net.u2x['hic'].strata_attn(qk, qk, v)
-                #     feats = key_conv(v.t()).t()
-                #     strata_ad.X = feats.detach().cpu().numpy()
-                #     strata_ad.obs['strata'] = k
-                #     chr20_ad = strata_ad[strata_ad.obs['chrom'].isin(keep_chroms)]
-                #     per_strata_ads.append(chr20_ad)
-                #     # x_pca = PCA(n_components=2).fit_transform(strata_ad.X)
-                #     # strata_ad.obsm['X_pca'] = x_pca
-
-                #     # sc.set_figure_params()
-                #     # fig = sc.pl.pca(strata_ad, color=["chrom", "type", "pos", "degree"], ncols=2, wspace=0.5, return_fig=True)
-                #     # fig.savefig(f'{out_dir}/{self.prefix}_pca_features_{save_i}.png')
-                #     # plt.close()
-
-                #     # # plot hic feature matrix
-                #     # mat_out_dir = f'{self.out_dir}/features/hic_feature_matrix_strata_{k}'
-                #     # os.makedirs(mat_out_dir, exist_ok=True)
-                #     # fig, ax = plt.subplots()
-                #     # sns.heatmap(strata_ad.X[:128, :], cmap='Spectral', center=0, ax=ax)
-                #     # ax.set_xticks([])
-                #     # ax.set_yticks([])
-                #     # # remove grid 
-                #     # ax.grid(False)
-                #     # ax.set_ylabel('Hi-C features')
-                #     # ax.set_xlabel('Feature embeddings')
-                #     # plt.savefig(f'{mat_out_dir}/{self.prefix}_hic_feature_matrix_{save_i}.png')
-                #     # plt.close()
-                # chr20_ad = ad.concat(per_strata_ads)
-                # print(chr20_ad)
-                # # compute PCA
-                # x_pca = PCA(n_components=2).fit_transform(chr20_ad.X)
-                # chr20_ad.obsm['X_pca'] = x_pca
-
-                # fig = sc.pl.pca(chr20_ad, color=["chrom", "type", "pos", "strata"], ncols=2, wspace=0.5, return_fig=True)
-                # fig.savefig(f'{feature_out_dir}/{self.prefix}_umap_strata_features_{save_i}.png')
-                # plt.close()
-
-                # visualize attention matrices
-                # attn_size = 64
-                # n_rows = 6
-                # attn_out_dir = f'{self.out_dir}/attn'
-                # os.makedirs(attn_out_dir, exist_ok=True)
-                # v = self.features_ad[self.features_ad.obs['type'] == 'Hi-C', :].X
-                # v = torch.as_tensor(v, device=net.device)
-                # fig, axs = plt.subplots(n_rows, len(net.u2x['hic'].key_layers), figsize=(len(net.u2x['hic'].key_layers) * 2, n_rows * 2))
-                # for row_i in range(n_rows):
-                #     #feats_in = torch.as_tensor(v[row_i * attn_size:(row_i + 1) * attn_size, :], device=net.device)
-                #     mean_mats = []
-                #     for key_layer, key_conv in zip(net.u2x['hic'].key_layers, net.u2x['hic'].key_convs):
-                #         #feats_in = key_conv(v.t()).t()
-                #         qk = key_layer(v)[row_i * attn_size:(row_i + 1) * attn_size, :]
-                #         attn_mat = torch.matmul(qk, qk.T) / math.sqrt(qk.shape[1])
-                #         #attn_mat = attn_mat.softmax(dim=1)
-                #         #attn_mat = attn_mat.softmax(dim=1).detach().cpu().numpy()
-                #         #_, attn_mat = self.mha(qk, qk, feats_in)
-                #         attn_mat = attn_mat.detach().cpu().numpy()
-                #         #mean_attn = attn_mat.mean(axis=0)
-                #         mean_mats.append(attn_mat)
-                #     try:
-                #         vmax = np.max(mean_mats)
-                        
-                #         for i, ax in enumerate(axs[row_i]):
-                #             mean_attn = mean_mats[i]
-                #             sns.heatmap(mean_attn, ax=ax, cmap='inferno', square=True, cbar=False, vmin=0, vmax=vmax)
-                #             # turn off ax grid
-                #             ax.grid(False)
-                #             ax.set_xticks([])
-                #             ax.set_yticks([])
-                #             if row_i == 0:
-                #                 ax.set_title(f'strata {i + 1}')
-                #     except Exception as e:
-                #         print(e)
-                #         print(mean_mats)
-                #         pass
-                # fig.savefig(f'{attn_out_dir}/{self.prefix}_attn_{save_i}.png')
-                # plt.close()
-                
-                # if epoch > 1:
-                #     chr10_11_ad = self.features_ad[self.features_ad.obs['chrom'].isin(['chr10', 'chr11'])]
-                #     sc.pp.neighbors(chr10_11_ad, metric="cosine")
-                #     sc.tl.umap(chr10_11_ad)
-                #     fig = sc.pl.umap(chr10_11_ad, color=["chrom", "type", "pos", "degree"], ncols=2, wspace=0.5, return_fig=True)
-                #     fig.savefig(f'{feature_out_dir}/{self.prefix}_umap_features_{save_i}.png')
-                #     plt.close()
 
                 transfer_labels(self.rna, self.hic, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
 
@@ -736,6 +754,10 @@ class EmbeddingVisualizer(TrainingPlugin):
                 # measure ari
                 ari_leiden = adjusted_rand_score(self.hic.obs['celltype_int'], self.hic.obs['leiden'])
                 ari_kmeans = adjusted_rand_score(self.hic.obs['celltype_int'], self.hic.obs['agglomerative'])
+                # measure silhouette score
+                sil_score_leiden = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['leiden'])
+                sil_score_kmeans = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['agglomerative'])
+                sil_score_joint = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['pred_celltype_int'])
 
                 # measure ari in joint embedding space (usually better than in Hi-C only space)
                 ari_joint = adjusted_rand_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'])
@@ -788,6 +810,56 @@ class EmbeddingVisualizer(TrainingPlugin):
                     ax.xaxis.tick_top()
                     fig.savefig(f'{sorted_confusion_matrix_out_dir}/{self.prefix}_confusion_sorted_{save_i}.png')
                     plt.close()
+
+                # if any cells are paired, check their embedding distance
+                avg_paired_dist = 0
+                paired_out_dir = f'{self.out_dir}/paired'
+                os.makedirs(paired_out_dir, exist_ok=True)
+                paired_mask = self.hic.obs_names.isin(self.rna.obs_names)
+                avg_corr = 0
+                avg_paired_expr_corr = 0
+                avg_paired_dist = 0
+                if np.sum(paired_mask) > 0:
+                    paired_hic = self.hic[paired_mask, :].copy()
+                    paired_rna = self.rna[self.rna.obs_names.isin(paired_hic.obs_names)].copy()
+                    hic_z = paired_hic.obsm['X_glue']
+                    rna_z = paired_rna.obsm['X_glue']
+                    print(hic_z.shape, rna_z.shape)
+                    dists = np.linalg.norm(hic_z - rna_z, axis=1)
+                    corrs = []
+                    for i in range(hic_z.shape[0]):
+                        corr, _ = pearsonr(hic_z[i], rna_z[i])
+                        corrs.append(corr)
+                    fig, ax = plt.subplots()
+                    sns.histplot(dists, ax=ax, kde=True)
+                    ax.set_xlabel('Distance')
+                    ax.set_ylabel('Frequency')
+                    ax.set_title('Paired Cell Distance')
+                    ax.grid(False)
+                    plt.savefig(f'{paired_out_dir}/{self.prefix}_paired_distance_{save_i}.png')
+                    plt.close()
+                    avg_paired_dist = np.mean(dists)
+                    avg_corr = np.mean(corrs)
+
+                    # measure how hic RNA expression prediction correlated with true RNA expression
+                    hic_pred_rna = paired_hic.obsm['X_pred_rna']
+                    rna_expr = paired_rna.obsm['X_pred_rna']
+                    #rna_expr = paired_rna.X[:, paired_rna.var['highly_variable']]
+                    expression_corrs = []
+                    for i in range(hic_pred_rna.shape[0]):
+                        corr, _ = pearsonr(hic_pred_rna[i].ravel().squeeze(), rna_expr[i].ravel().squeeze())
+                        expression_corrs.append(corr)
+                    fig, ax = plt.subplots()
+                    sns.histplot(expression_corrs, ax=ax, kde=True)
+                    ax.set_xlabel('Correlation')
+                    ax.set_ylabel('Frequency')
+                    ax.set_title('Paired Cell RNA Expression Correlation')
+                    ax.grid(False)
+                    plt.savefig(f'{paired_out_dir}/{self.prefix}_paired_rna_corr_{save_i}.png')
+                    plt.close()
+                    avg_paired_expr_corr = np.mean(expression_corrs)
+
+
                 
                 self.logger.info(f"ARI (Hi-C only): {ari_kmeans:.2f}, ARI (joint): {ari_joint:.2f}, Accuracy (joint): {accuracy:.2f}, Balanced Accuracy (joint): {balanced_accuracy:.2f}")
                 wandb.log({f"ari_{self.prefix}": ari_kmeans, 
@@ -800,6 +872,12 @@ class EmbeddingVisualizer(TrainingPlugin):
                             f"val_accuracy_{self.prefix}": val_accuracy,
                             f"val_balanced_accuracy_{self.prefix}": val_balanced_accuracy,
                             f"val_ari_{self.prefix}": val_ari,
+                            f"avg_paired_dist_{self.prefix}": avg_paired_dist,
+                            f"avg_corr_{self.prefix}": avg_corr,
+                            f"avg_expression_corr_{self.prefix}": avg_paired_expr_corr,
+                            f"silhouette_leiden_{self.prefix}": sil_score_leiden,
+                            f"silhouette_kmeans_{self.prefix}": sil_score_kmeans,
+                            f"silhouette_joint_{self.prefix}": sil_score_joint,
                            "epoch": epoch}, step=epoch)
                 
 

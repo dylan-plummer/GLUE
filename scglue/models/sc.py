@@ -896,6 +896,12 @@ class StratifiedNBDataDecoder(DataDecoder):
         )
     
 
+class GEGLU(torch.nn.Module):
+    def forward(self, x):
+        x, gate = x.chunk(2, dim = -1)
+        return x * F.gelu(gate)
+    
+
 class StratifiedZINBDataDecoder(DataDecoder):
     r"""
     Modified Zero-inflated negative binomial data decoder
@@ -920,8 +926,13 @@ class StratifiedZINBDataDecoder(DataDecoder):
         self.key_convs = []
         self.key_conv_activations = []
         self.key_layers = []
+        self.value_layers = []
         self.key_ln_layers = []
         self.attn_layers = []
+        self.prenorm_layers = []
+        self.postnorm_layers = []
+        self.ff_layers = []
+        self.ff_activations = []
         # self.value_layers = []
         # self.self_query_layers = []
         # self.self_key_layers = []
@@ -936,23 +947,33 @@ class StratifiedZINBDataDecoder(DataDecoder):
             #torch.nn.init.constant_(key_conv.weight, 1/3)
             self.key_convs.append(key_conv)
             self.key_conv_activations.append(key_conv_activation)
-            self.key_layers.append(torch.nn.Linear(embedding_size, embedding_size))
+            self.key_layers.append(torch.nn.Linear(embedding_size, embedding_size, bias=False))
+            self.value_layers.append(torch.nn.Linear(embedding_size, embedding_size, bias=False))
             #self.key_ln_layers.append(torch.nn.LayerNorm(embedding_size))
             self.attn_layers.append(LocalAttention(
                                     dim = embedding_size,
                                     window_size = input_dim,
                                     autopad = True,
                                     shared_qk = True))
+            self.prenorm_layers.append(torch.nn.LayerNorm(embedding_size))
+            self.postnorm_layers.append(torch.nn.LayerNorm(embedding_size))
+            self.ff_layers.append(torch.nn.Linear(embedding_size, embedding_size * 2, bias=False))
+            self.ff_activations.append(GEGLU())
             # self.value_layers.append(torch.nn.Linear(embedding_size, embedding_size))
             # self.self_query_layers.append(torch.nn.Linear(embedding_size, embedding_size))
             # self.self_key_layers.append(torch.nn.Linear(embedding_size, embedding_size))
             # self.self_value_layers.append(torch.nn.Linear(embedding_size, embedding_size))
         #self.query_layers = torch.nn.ModuleList(self.query_layers)
         self.key_layers = torch.nn.ModuleList(self.key_layers)
+        self.value_layers = torch.nn.ModuleList(self.value_layers)
         self.key_convs = torch.nn.ModuleList(self.key_convs)
         self.key_conv_activations = torch.nn.ModuleList(self.key_conv_activations)
         #self.key_ln_layers = torch.nn.ModuleList(self.key_ln_layers)
         self.attn_layers = torch.nn.ModuleList(self.attn_layers)
+        self.prenorm_layers = torch.nn.ModuleList(self.prenorm_layers)
+        self.postnorm_layers = torch.nn.ModuleList(self.postnorm_layers)
+        self.ff_layers = torch.nn.ModuleList(self.ff_layers)
+        self.ff_activations = torch.nn.ModuleList(self.ff_activations)
         # self.value_layers = torch.nn.ModuleList(self.value_layers)
         # self.self_query_layers = torch.nn.ModuleList(self.self_query_layers)
         # self.self_key_layers = torch.nn.ModuleList(self.self_key_layers)
@@ -995,8 +1016,11 @@ class StratifiedZINBDataDecoder(DataDecoder):
                 
                 #v = self.strata_attn(qk, qk, v)
                 if self.use_attn:
+                    v = self.prenorm_layers[k - 1](v)
                     qk = self.key_layers[k - 1](v)
-                    key = self.attn_layers[k - 1](qk, qk, v)
+                    v = self.value_layers[k - 1](v)
+                    key = v + self.attn_layers[k - 1](qk, qk, v)
+                    key = key + self.ff_activations[k - 1](self.ff_layers[k - 1](self.postnorm_layers[k - 1](key)))
                 else:
                     key = self.key_convs[k - 1](v.t()).t()
                     if self.use_activation:
