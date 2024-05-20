@@ -752,6 +752,7 @@ class SCGLUEModel(Model):
             shifted_additive: bool = False,
             use_activation: bool = False,
             use_attn: bool = False,
+            binarize: bool = False,
             n_strata: int = 5,
             random_seed: int = 0
     ) -> None:
@@ -863,7 +864,8 @@ class SCGLUEModel(Model):
                     strata_masks=strata_masks,
                     shifted_additive=shifted_additive,
                     use_activation=use_activation,
-                    use_attn=use_attn
+                    use_attn=use_attn,
+                    binarize=binarize
                 )
             else:
                 x2u[k] = _ENCODER_MAP[data_config["prob_model"]](

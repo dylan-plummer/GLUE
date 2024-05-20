@@ -915,7 +915,8 @@ class StratifiedZINBDataDecoder(DataDecoder):
     """
 
     def __init__(self, out_features: int, n_batches: int = 1, input_dim: int = 5, embedding_size: int = 50, n_nodes = 10000, dropout: float = 0.2,
-                 feature_masks: list = [], strata_masks: list = [], shifted_additive: bool = False, use_activation: bool = False, use_attn: bool = False) -> None:
+                 feature_masks: list = [], strata_masks: list = [], shifted_additive: bool = False, use_activation: bool = False, use_attn: bool = False,
+                 binarize: bool = False) -> None:
         super().__init__(out_features, n_batches=n_batches)
         self.scale_lin = torch.nn.Parameter(torch.zeros(n_batches, out_features))
         self.bias = torch.nn.Parameter(torch.zeros(n_batches, out_features))
@@ -983,7 +984,9 @@ class StratifiedZINBDataDecoder(DataDecoder):
         self.shifted_additive = shifted_additive
         self.use_activation = use_activation
         self.use_attn = use_attn
-        self.zi_logits = torch.nn.Parameter(torch.zeros(n_batches, out_features))
+        self.binarize = binarize
+        if not binarize:
+            self.zi_logits = torch.nn.Parameter(torch.zeros(n_batches, out_features))
         self.attn_norm = 1 / math.sqrt(embedding_size)
         self.embedding_size = embedding_size
 
@@ -1042,10 +1045,13 @@ class StratifiedZINBDataDecoder(DataDecoder):
             # decoded_strata = (values @ self_attention)
             #decoded_strata = self.output_dropout(decoded_strata)
             logit_mu = scale_slice * decoded_strata + bias_slice
-            mu = F.softmax(logit_mu, dim=1) * l
+            if not self.binarize:
+                mu = F.softmax(logit_mu, dim=1) * l
             mu_slices.append(mu)
 
         mu = torch.concat(mu_slices, dim=1)  # because of this we need at least the strata to be sorted in the node embedding
+        if self.binarize:
+            return D.Bernoulli(mu)
         return ZINB(
             self.zi_logits[b].expand_as(mu),
             log_theta.exp(),

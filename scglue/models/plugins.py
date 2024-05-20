@@ -20,6 +20,7 @@ import anndata as ad
 import scanpy as sc
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.colors import PowerNorm
 from adjustText import adjust_text
 from scipy.stats import pearsonr
 from sklearn.decomposition import PCA
@@ -212,14 +213,14 @@ class LRScheduler(TrainingPlugin):
         self.monitor = monitor
         if patience is None:
             raise ValueError("`patience` must be specified!")
-        # self.schedulers = [
-        #     ReduceLROnPlateau(optim, patience=patience, verbose=True)
-        #     for optim in optims
-        # ]
         self.schedulers = [
-            CosineAnnealingWarmRestarts(optim, T_0=patience, T_mult=2, verbose=True)
+            ReduceLROnPlateau(optim, patience=patience, verbose=True)
             for optim in optims
         ]
+        # self.schedulers = [
+        #     CosineAnnealingWarmRestarts(optim, T_0=patience, T_mult=2, verbose=True)
+        #     for optim in optims
+        # ]
         self.burnin = burnin
 
     def attach(
@@ -241,8 +242,8 @@ class LRScheduler(TrainingPlugin):
             update_flags = set()
             for scheduler in self.schedulers:
                 old_lr = scheduler.optimizer.param_groups[0]["lr"]
-                #scheduler.step(score_engine.state.metrics[self.monitor])
-                scheduler.step()
+                scheduler.step(score_engine.state.metrics[self.monitor])
+                #scheduler.step()
                 new_lr = scheduler.optimizer.param_groups[0]["lr"]
                 update_flags.add(new_lr != old_lr)
             if len(update_flags) != 1:
@@ -291,6 +292,9 @@ class EmbeddingVisualizer(TrainingPlugin):
         self.out_dir = out_dir
         os.makedirs(self.out_dir, exist_ok=True)
 
+    def construct_matrix_from_locus(self, locus):
+        pass
+
     def attach(
             self, net: torch.nn.Module, trainer: Trainer,
             train_engine: ignite.engine.Engine,
@@ -304,7 +308,7 @@ class EmbeddingVisualizer(TrainingPlugin):
         @train_engine.on(EPOCH_COMPLETED)  # pylint: disable=not-callable
         def _():
             epoch = train_engine.state.epoch
-            save_interval = 10
+            save_interval = 5
             if epoch % save_interval == 0:
                 save_i = int(epoch // save_interval)  # for animation
                 # get hic embeddings
@@ -389,13 +393,17 @@ class EmbeddingVisualizer(TrainingPlugin):
                     persistent_workers=False
                 )
                 hic_pred_rna = []
+                hic_pred_hic = []
                 for u_, b_, l_ in data_loader:
                     u_ = u_.to(net.device, non_blocking=True)
                     b_ = b_.to(net.device, non_blocking=True)
                     l_ = l_.to(net.device, non_blocking=True)
                     hic_pred_rna.append(net.u2x['rna'](u_, v_rna, b_, l_).mean.detach().cpu())
+                    hic_pred_hic.append(net.u2x['hic'](u_, v_hic, b_, l_).mean.detach().cpu())
                 hic_pred_rna = torch.cat(hic_pred_rna).numpy()
                 self.hic.obsm['X_pred_rna'] = hic_pred_rna
+                hic_pred_hic = torch.cat(hic_pred_hic).numpy()
+                self.hic.obsm['X_pred_hic'] = hic_pred_hic
 
                 data = ArrayDataset(self.rna.obsm['X_glue'], b_rna, l_rna, getitem_size=128)
                 data_loader = DataLoader(
@@ -405,13 +413,124 @@ class EmbeddingVisualizer(TrainingPlugin):
                     persistent_workers=False
                 )
                 rna_pred_rna = []
+                rna_pred_hic = []
                 for u_, b_, l_ in data_loader:
                     u_ = u_.to(net.device, non_blocking=True)
                     b_ = b_.to(net.device, non_blocking=True)
                     l_ = l_.to(net.device, non_blocking=True)
                     rna_pred_rna.append(net.u2x['rna'](u_, v_rna, b_, l_).mean.detach().cpu())
+                    rna_pred_hic.append(net.u2x['hic'](u_, v_hic, b_, l_).mean.detach().cpu())
                 rna_pred_rna = torch.cat(rna_pred_rna).numpy()
                 self.rna.obsm['X_pred_rna'] = rna_pred_rna
+                rna_pred_hic = torch.cat(rna_pred_hic).numpy()
+                self.rna.obsm['X_pred_hic'] = rna_pred_hic
+
+                if 'Alpha' in self.hic.obs['celltype'].unique() or 'Beta' in self.hic.obs['celltype'].unique():
+                    example_genes = ['INS', 'GCG', 'CEL', 'LOXL4', 'WFS1']
+                else:
+                    example_genes = ['NR2F1', 'CNTN4', 'SYT1', 'GAD1', 'GAD2']
+                    #example_genes = ['GAD2']
+
+                heatmap_out_dir = f'{self.out_dir}/heatmaps'
+                celltype_heatmaps_out_dir = f'{self.out_dir}/celltype_heatmaps'
+                os.makedirs(heatmap_out_dir, exist_ok=True)
+                os.makedirs(celltype_heatmaps_out_dir, exist_ok=True)
+                n_strata = len(net.u2x['hic'].key_convs)
+                bin_size = abs(self.hic.var['chromEnd'].iloc[0] - self.hic.var['chromStart'].iloc[0])
+                heatmap_range = n_strata * bin_size
+                for g in example_genes:
+                    try:
+                        locus = self.rna.var.loc[g]
+                    except KeyError:
+                        try:
+                            locus = self.rna.var.loc[g.lower().capitalize()]
+                        except KeyError:
+                            continue
+                    hic_mask = (self.hic.var['chrom'] == locus['chrom']) & (self.hic.var['chromStart'] >= locus['chromStart'] - heatmap_range) & (self.hic.var['chromStart'] <= locus['chromStart'] + heatmap_range)
+                    hic_feats = self.hic.var.loc[hic_mask]
+                    hic_feat_names = self.hic.var_names[hic_mask]
+                    original_pixels = self.hic.layers['counts'][:, hic_mask]
+                    pred_pixels = self.hic.obsm['X_pred_hic'][:, hic_mask]
+                    
+                    mat_size = int(2 * heatmap_range / bin_size) + 1
+                    mat = np.zeros((mat_size, mat_size))
+                    std_mat = np.zeros((mat_size, mat_size))
+                    pred_mat = np.zeros((mat_size, mat_size))
+                    pred_std_mat = np.zeros((mat_size, mat_size))
+                    for pixel_i in range(len(hic_feat_names)):
+                        pixel = hic_feats.iloc[pixel_i]
+                        pixel_name = hic_feat_names[pixel_i]
+                        row = int((pixel['chromStart'] - locus['chromStart'] + heatmap_range) / bin_size)
+                        col = row
+                        if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                            col += int(pixel_name.split('-')[-1])
+                        try:
+                            mat[row, col] = original_pixels[:, pixel_i].mean()
+                            mat[col, row] = mat[row, col]
+                            pred_mat[row, col] = pred_pixels[:, pixel_i].mean()
+                            pred_mat[col, row] = pred_mat[row, col]
+                            std_mat[row, col] = original_pixels[:, pixel_i].std()
+                            std_mat[col, row] = std_mat[row, col]
+                            pred_std_mat[row, col] = pred_pixels[:, pixel_i].std()
+                            pred_std_mat[col, row] = pred_std_mat[row, col]
+                        except Exception as e:
+                            print(e)
+                            continue
+                    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+                    sns.heatmap(np.log1p(mat), ax=axs[0][0], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
+                    axs[0][0].set_title(f'Mean Original Hi-C {g}')
+                    axs[0][0].set_xticks([])
+                    axs[0][0].set_yticks([])
+                    sns.heatmap(pred_mat, ax=axs[0][1], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
+                    axs[0][1].set_title(f'Mean Predicted Hi-C {g}')
+                    axs[0][1].set_xticks([])
+                    axs[0][1].set_yticks([])
+                    sns.heatmap(std_mat, ax=axs[1][0], cmap='Greens', square=True, cbar=False)
+                    axs[1][0].set_title(f'Original Hi-C Std {g}')
+                    axs[1][0].set_xticks([])
+                    axs[1][0].set_yticks([])
+                    sns.heatmap(pred_std_mat, ax=axs[1][1], cmap='Greens', square=True, cbar=False)
+                    axs[1][1].set_title(f'Predicted Hi-C Std {g}')
+                    axs[1][1].set_xticks([])
+                    axs[1][1].set_yticks([])
+                    plt.savefig(f'{heatmap_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
+                    plt.close()
+
+                    # plot celltype heatmaps
+                    fig, axs = plt.subplots(2, len(self.rna.obs['celltype'].unique()), figsize=(6 * len(self.rna.obs['celltype'].unique()), 6))
+                    for celltype_i, celltype in enumerate(sorted(self.rna.obs['celltype'].unique())):
+                        celltype_mask = self.rna.obs['celltype'] == celltype
+                        celltype_rna = self.rna[celltype_mask]
+                        celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
+                        celltype_mat = np.zeros((mat_size, mat_size))
+                        celltype_std_mat = np.zeros((mat_size, mat_size))   
+
+                        for pixel_i in range(len(hic_feat_names)):
+                            pixel = hic_feats.iloc[pixel_i]
+                            pixel_name = hic_feat_names[pixel_i]
+                            row = int((pixel['chromStart'] - locus['chromStart'] + heatmap_range) / bin_size)
+                            col = row
+                            if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                                col += int(pixel_name.split('-')[-1])
+                            try:
+                                celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
+                                celltype_mat[col, row] = celltype_mat[row, col]
+                                celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
+                                celltype_std_mat[col, row] = celltype_std_mat[row, col]
+                            except Exception as e:
+                                continue
+                        sns.heatmap(celltype_mat, ax=axs[0][celltype_i], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
+                        axs[0][celltype_i].set_title(celltype)
+                        axs[0][celltype_i].set_xticks([])
+                        axs[0][celltype_i].set_yticks([])
+                        sns.heatmap(celltype_std_mat, ax=axs[1][celltype_i], cmap='Greens', square=True, cbar=False)
+                        axs[1][celltype_i].set_title(f'{celltype} Std')
+                        axs[1][celltype_i].set_xticks([])
+                        axs[1][celltype_i].set_yticks([])
+                    plt.tight_layout()
+                    plt.savefig(f'{celltype_heatmaps_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
+                    plt.close()
+
 
                 net.train()
 
@@ -490,11 +609,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                 # plot a few neighborhood examples
                 # example_genes = ['GAD1', 'INS', 'GCG', 'CEL', 'LOXL4', 'WFS1', 'PPY', 'EPSTI1', 'PPARG', 'ANK1', 'TSPAN8', 'LPP',
                 #                  'OTUD3', 'LRRTM3', 'BAACL', 'SLC14A1', 'ARNTL2', 'IRX2']
-                if 'Alpha' in self.hic.obs['celltype'].unique() or 'Beta' in self.hic.obs['celltype'].unique():
-                    example_genes = ['INS', 'GCG', 'CEL', 'LOXL4', 'WFS1']
-                else:
-                    example_genes = ['NR2F1', 'CNTN4', 'SYT1', 'GAD1', 'GAD2']
-                    example_genes = ['GAD2']
+                
                 graph_out_dir = f'{self.out_dir}/loop_graph'
                 for g in example_genes:
                     if g not in self.vertices:
