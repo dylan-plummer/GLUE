@@ -1045,8 +1045,7 @@ class StratifiedZINBDataDecoder(DataDecoder):
             # decoded_strata = (values @ self_attention)
             #decoded_strata = self.output_dropout(decoded_strata)
             logit_mu = scale_slice * decoded_strata + bias_slice
-            if not self.binarize:
-                mu = F.softmax(logit_mu, dim=1) * l
+            mu = F.softmax(logit_mu, dim=1) * l
             mu_slices.append(mu)
 
         mu = torch.concat(mu_slices, dim=1)  # because of this we need at least the strata to be sorted in the node embedding
