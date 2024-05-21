@@ -985,7 +985,9 @@ class StratifiedZINBDataDecoder(DataDecoder):
         self.use_activation = use_activation
         self.use_attn = use_attn
         self.binarize = binarize
-        if not binarize:
+        if binarize:
+            self.ber_logits = torch.nn.Parameter(torch.zeros(n_batches, out_features))
+        else:
             self.zi_logits = torch.nn.Parameter(torch.zeros(n_batches, out_features))
         self.attn_norm = 1 / math.sqrt(embedding_size)
         self.embedding_size = embedding_size
@@ -1053,7 +1055,7 @@ class StratifiedZINBDataDecoder(DataDecoder):
 
         mu = torch.concat(mu_slices, dim=1)  # because of this we need at least the strata to be sorted in the node embedding
         if self.binarize:
-            return D.Bernoulli(mu)
+            return D.Bernoulli(self.ber_logits[b].expand_as(mu))
         return ZINB(
             self.zi_logits[b].expand_as(mu),
             log_theta.exp(),
