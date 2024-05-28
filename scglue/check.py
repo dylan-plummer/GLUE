@@ -147,7 +147,7 @@ INSTALL_HINTS = types.SimpleNamespace(
 CHECKERS = dict(
     bedtools=CmdChecker(
         "bedtools", f"{config.BEDTOOLS_PATH or 'bedtools'} --version", r"v([0-9\.]+)",
-        vmin="2.29.2", install_hint=INSTALL_HINTS.bedtools
+        vmin="2.26.0", install_hint=INSTALL_HINTS.bedtools
     ),
     plotly=ModuleChecker(
         "plotly",
