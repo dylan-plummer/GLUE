@@ -412,7 +412,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                     pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
                     persistent_workers=False
                 )
-                if self.rna.shape[0] < 2000:
+                if self.rna.shape[0] < 20000:
                     rna_pred_rna = []
                     rna_pred_hic = []
                     for u_, b_, l_ in data_loader:
@@ -737,45 +737,49 @@ class EmbeddingVisualizer(TrainingPlugin):
                     for celltype_i, celltype in enumerate(sorted(self.rna.obs['celltype'].unique())):
                         celltype_mask = self.rna.obs['celltype'] == celltype
                         celltype_rna = self.rna[celltype_mask]
-                        celltype_original_pixels = self.rna.layers['counts'][celltype_mask, :]
-                        celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
-                        celltype_mat = np.zeros((mat_size, mat_size))
-                        celltype_original_mat = np.zeros((mat_size, mat_size))
-                        celltype_std_mat = np.zeros((mat_size, mat_size))   
+                        #celltype_original_pixels = self.rna.layers['counts'][celltype_mask, :]
+                        try:
+                            celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
+                            celltype_mat = np.zeros((mat_size, mat_size))
+                            #celltype_original_mat = np.zeros((mat_size, mat_size))
+                            celltype_std_mat = np.zeros((mat_size, mat_size))   
 
-                        for pixel_i in range(len(hic_feat_names)):
-                            pixel = hic_feats.iloc[pixel_i]
-                            pixel_name = hic_feat_names[pixel_i]
+                            for pixel_i in range(len(hic_feat_names)):
+                                pixel = hic_feats.iloc[pixel_i]
+                                pixel_name = hic_feat_names[pixel_i]
 
-                            # row is integer index from hic_neighborhood_ad
-                            if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                                row = hic_neighborhood_ad.obs.index.get_loc(pixel_name[:pixel_name.rfind('-')])
-                            else:
-                                row = hic_neighborhood_ad.obs.index.get_loc(pixel_name)
-                            col = row
-                            if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                                col += int(pixel_name.split('-')[-1])
-                            try:
-                                celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
-                                celltype_original_mat[row, col] = celltype_original_pixels[:, pixel_i].mean()
-                                celltype_original_mat[col, row] = celltype_original_mat[row, col]
-                                celltype_mat[col, row] = celltype_mat[row, col]
-                                celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
-                                celltype_std_mat[col, row] = celltype_std_mat[row, col]
-                            except Exception as e:
-                                continue
-                        sns.heatmap(celltype_mat, ax=axs[0][celltype_i], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False, vmin=0, vmax=vmax)
-                        axs[0][celltype_i].set_title(celltype)
-                        axs[0][celltype_i].set_xticks([])
-                        axs[0][celltype_i].set_yticks([])
-                        sns.heatmap(celltype_std_mat, ax=axs[1][celltype_i], cmap='Greens', square=True, cbar=False)
-                        axs[1][celltype_i].set_title(f'{celltype} Std')
-                        axs[1][celltype_i].set_xticks([])
-                        axs[1][celltype_i].set_yticks([])
-                        # compute celltype attention correlation
-                        celltype_corr, _ = pearsonr(mean_attn.flatten(), celltype_original_mat.flatten())
-                        celltype_gene_attention_corrs[celltype + '_' + g] = celltype_corr
-                        print(f'{celltype} attention correlation: {celltype_corr}')
+                                # row is integer index from hic_neighborhood_ad
+                                if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                                    row = hic_neighborhood_ad.obs.index.get_loc(pixel_name[:pixel_name.rfind('-')])
+                                else:
+                                    row = hic_neighborhood_ad.obs.index.get_loc(pixel_name)
+                                col = row
+                                if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                                    col += int(pixel_name.split('-')[-1])
+                                try:
+                                    celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
+                                    #celltype_original_mat[row, col] = celltype_original_pixels[:, pixel_i].mean()
+                                    #celltype_original_mat[col, row] = celltype_original_mat[row, col]
+                                    celltype_mat[col, row] = celltype_mat[row, col]
+                                    celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
+                                    celltype_std_mat[col, row] = celltype_std_mat[row, col]
+                                except Exception as e:
+                                    continue
+                            sns.heatmap(celltype_mat, ax=axs[0][celltype_i], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False, vmin=0, vmax=vmax)
+                            axs[0][celltype_i].set_title(celltype)
+                            axs[0][celltype_i].set_xticks([])
+                            axs[0][celltype_i].set_yticks([])
+                            sns.heatmap(celltype_std_mat, ax=axs[1][celltype_i], cmap='Greens', square=True, cbar=False)
+                            axs[1][celltype_i].set_title(f'{celltype} Std')
+                            axs[1][celltype_i].set_xticks([])
+                            axs[1][celltype_i].set_yticks([])
+                            # compute celltype attention correlation
+                            celltype_corr, _ = pearsonr(mean_attn.flatten(), celltype_mat.flatten())
+                            celltype_gene_attention_corrs[celltype + '_' + g] = celltype_corr
+                            print(f'{celltype} attention correlation: {celltype_corr}')
+                        except Exception as e:
+                            print(e)
+                            continue
 
                     plt.tight_layout()
                     plt.savefig(f'{celltype_heatmaps_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
