@@ -412,18 +412,19 @@ class EmbeddingVisualizer(TrainingPlugin):
                     pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
                     persistent_workers=False
                 )
-                rna_pred_rna = []
-                rna_pred_hic = []
-                for u_, b_, l_ in data_loader:
-                    u_ = u_.to(net.device, non_blocking=True)
-                    b_ = b_.to(net.device, non_blocking=True)
-                    l_ = l_.to(net.device, non_blocking=True)
-                    rna_pred_rna.append(net.u2x['rna'](u_, v_rna, b_, l_).mean.detach().cpu())
-                    rna_pred_hic.append(net.u2x['hic'](u_, v_hic, b_, l_).mean.detach().cpu())
-                rna_pred_rna = torch.cat(rna_pred_rna).numpy()
-                self.rna.obsm['X_pred_rna'] = rna_pred_rna
-                rna_pred_hic = torch.cat(rna_pred_hic).numpy()
-                self.rna.obsm['X_pred_hic'] = rna_pred_hic
+                if self.rna.shape[0] < 2000:
+                    rna_pred_rna = []
+                    rna_pred_hic = []
+                    for u_, b_, l_ in data_loader:
+                        u_ = u_.to(net.device, non_blocking=True)
+                        b_ = b_.to(net.device, non_blocking=True)
+                        l_ = l_.to(net.device, non_blocking=True)
+                        rna_pred_rna.append(net.u2x['rna'](u_, v_rna, b_, l_).mean.detach().cpu())
+                        rna_pred_hic.append(net.u2x['hic'](u_, v_hic, b_, l_).mean.detach().cpu())
+                    rna_pred_rna = torch.cat(rna_pred_rna).numpy()
+                    self.rna.obsm['X_pred_rna'] = rna_pred_rna
+                    rna_pred_hic = torch.cat(rna_pred_hic).numpy()
+                    self.rna.obsm['X_pred_hic'] = rna_pred_hic
 
                 if 'Alpha' in self.hic.obs['celltype'].unique() or 'Beta' in self.hic.obs['celltype'].unique():
                     example_genes = ['INS', 'GCG', 'CEL', 'LOXL4', 'WFS1']
@@ -477,7 +478,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                             print(e)
                             continue
                     fig, axs = plt.subplots(2, 2, figsize=(10, 10))
-                    sns.heatmap(np.log1p(mat), ax=axs[0][0], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
+                    sns.heatmap(mat, ax=axs[0][0], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
                     axs[0][0].set_title(f'Mean Original Hi-C {g}')
                     axs[0][0].set_xticks([])
                     axs[0][0].set_yticks([])
@@ -497,39 +498,40 @@ class EmbeddingVisualizer(TrainingPlugin):
                     plt.close()
 
                     # plot celltype heatmaps
-                    fig, axs = plt.subplots(2, len(self.rna.obs['celltype'].unique()), figsize=(6 * len(self.rna.obs['celltype'].unique()), 6))
-                    for celltype_i, celltype in enumerate(sorted(self.rna.obs['celltype'].unique())):
-                        celltype_mask = self.rna.obs['celltype'] == celltype
-                        celltype_rna = self.rna[celltype_mask]
-                        celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
-                        celltype_mat = np.zeros((mat_size, mat_size))
-                        celltype_std_mat = np.zeros((mat_size, mat_size))   
+                    # fig, axs = plt.subplots(2, len(self.rna.obs['celltype'].unique()), figsize=(6 * len(self.rna.obs['celltype'].unique()), 6))
+                    # vmax = np.max(mat)
+                    # for celltype_i, celltype in enumerate(sorted(self.rna.obs['celltype'].unique())):
+                    #     celltype_mask = self.rna.obs['celltype'] == celltype
+                    #     celltype_rna = self.rna[celltype_mask]
+                    #     celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
+                    #     celltype_mat = np.zeros((mat_size, mat_size))
+                    #     celltype_std_mat = np.zeros((mat_size, mat_size))   
 
-                        for pixel_i in range(len(hic_feat_names)):
-                            pixel = hic_feats.iloc[pixel_i]
-                            pixel_name = hic_feat_names[pixel_i]
-                            row = int((pixel['chromStart'] - locus['chromStart'] + heatmap_range) / bin_size)
-                            col = row
-                            if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                                col += int(pixel_name.split('-')[-1])
-                            try:
-                                celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
-                                celltype_mat[col, row] = celltype_mat[row, col]
-                                celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
-                                celltype_std_mat[col, row] = celltype_std_mat[row, col]
-                            except Exception as e:
-                                continue
-                        sns.heatmap(celltype_mat, ax=axs[0][celltype_i], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
-                        axs[0][celltype_i].set_title(celltype)
-                        axs[0][celltype_i].set_xticks([])
-                        axs[0][celltype_i].set_yticks([])
-                        sns.heatmap(celltype_std_mat, ax=axs[1][celltype_i], cmap='Greens', square=True, cbar=False)
-                        axs[1][celltype_i].set_title(f'{celltype} Std')
-                        axs[1][celltype_i].set_xticks([])
-                        axs[1][celltype_i].set_yticks([])
-                    plt.tight_layout()
-                    plt.savefig(f'{celltype_heatmaps_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
-                    plt.close()
+                    #     for pixel_i in range(len(hic_feat_names)):
+                    #         pixel = hic_feats.iloc[pixel_i]
+                    #         pixel_name = hic_feat_names[pixel_i]
+                    #         row = int((pixel['chromStart'] - locus['chromStart'] + heatmap_range) / bin_size)
+                    #         col = row
+                    #         if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                    #             col += int(pixel_name.split('-')[-1])
+                    #         try:
+                    #             celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
+                    #             celltype_mat[col, row] = celltype_mat[row, col]
+                    #             celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
+                    #             celltype_std_mat[col, row] = celltype_std_mat[row, col]
+                    #         except Exception as e:
+                    #             continue
+                    #     sns.heatmap(celltype_mat, ax=axs[0][celltype_i], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False, vmin=0, vmax=vmax)
+                    #     axs[0][celltype_i].set_title(celltype)
+                    #     axs[0][celltype_i].set_xticks([])
+                    #     axs[0][celltype_i].set_yticks([])
+                    #     sns.heatmap(celltype_std_mat, ax=axs[1][celltype_i], cmap='Greens', square=True, cbar=False)
+                    #     axs[1][celltype_i].set_title(f'{celltype} Std')
+                    #     axs[1][celltype_i].set_xticks([])
+                    #     axs[1][celltype_i].set_yticks([])
+                    # plt.tight_layout()
+                    # plt.savefig(f'{celltype_heatmaps_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
+                    # plt.close()
 
 
                 net.train()
@@ -769,8 +771,8 @@ class EmbeddingVisualizer(TrainingPlugin):
                         arrowprops=dict(arrowstyle="->", color="gray", lw=1),
                         ax=ax,
                     )
-                    # plt.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_labeled_pca_features_{save_i}.png')
-                    # plt.close()
+                    plt.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_labeled_pca_features_{save_i}.png')
+                    plt.close()
                     try:
                         sc.pp.neighbors(per_strata_ad)
                         # sc.tl.draw_graph(per_strata_ad, layout='kk')
@@ -957,22 +959,25 @@ class EmbeddingVisualizer(TrainingPlugin):
                     avg_corr = np.mean(corrs)
 
                     # measure how hic RNA expression prediction correlated with true RNA expression
-                    hic_pred_rna = paired_hic.obsm['X_pred_rna']
-                    rna_expr = paired_rna.obsm['X_pred_rna']
-                    #rna_expr = paired_rna.X[:, paired_rna.var['highly_variable']]
-                    expression_corrs = []
-                    for i in range(hic_pred_rna.shape[0]):
-                        corr, _ = pearsonr(hic_pred_rna[i].ravel().squeeze(), rna_expr[i].ravel().squeeze())
-                        expression_corrs.append(corr)
-                    fig, ax = plt.subplots()
-                    sns.histplot(expression_corrs, ax=ax, kde=True)
-                    ax.set_xlabel('Correlation')
-                    ax.set_ylabel('Frequency')
-                    ax.set_title('Paired Cell RNA Expression Correlation')
-                    ax.grid(False)
-                    plt.savefig(f'{paired_out_dir}/{self.prefix}_paired_rna_corr_{save_i}.png')
-                    plt.close()
-                    avg_paired_expr_corr = np.mean(expression_corrs)
+                    try:
+                        hic_pred_rna = paired_hic.obsm['X_pred_rna']
+                        rna_expr = paired_rna.obsm['X_pred_rna']
+                        #rna_expr = paired_rna.X[:, paired_rna.var['highly_variable']]
+                        expression_corrs = []
+                        for i in range(hic_pred_rna.shape[0]):
+                            corr, _ = pearsonr(hic_pred_rna[i].ravel().squeeze(), rna_expr[i].ravel().squeeze())
+                            expression_corrs.append(corr)
+                        fig, ax = plt.subplots()
+                        sns.histplot(expression_corrs, ax=ax, kde=True)
+                        ax.set_xlabel('Correlation')
+                        ax.set_ylabel('Frequency')
+                        ax.set_title('Paired Cell RNA Expression Correlation')
+                        ax.grid(False)
+                        plt.savefig(f'{paired_out_dir}/{self.prefix}_paired_rna_corr_{save_i}.png')
+                        plt.close()
+                        avg_paired_expr_corr = np.mean(expression_corrs)
+                    except Exception as e:
+                        print(e)
 
 
                 
