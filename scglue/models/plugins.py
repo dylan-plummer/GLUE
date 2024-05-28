@@ -728,7 +728,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                     plt.close()
 
                     # compute correlation with mean attention
-                    mean_attn_corr, _ = pearsonr(mean_attn.flatten(), pred_mat.flatten())
+                    mean_attn_corr, _ = pearsonr(mean_attn.flatten(), mat.flatten())
                     gene_attention_corrs[g] = mean_attn_corr
 
                     # plot celltype heatmaps
@@ -737,8 +737,10 @@ class EmbeddingVisualizer(TrainingPlugin):
                     for celltype_i, celltype in enumerate(sorted(self.rna.obs['celltype'].unique())):
                         celltype_mask = self.rna.obs['celltype'] == celltype
                         celltype_rna = self.rna[celltype_mask]
+                        celltype_original_pixels = self.rna.layers['counts'][celltype_mask, :]
                         celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
                         celltype_mat = np.zeros((mat_size, mat_size))
+                        celltype_original_mat = np.zeros((mat_size, mat_size))
                         celltype_std_mat = np.zeros((mat_size, mat_size))   
 
                         for pixel_i in range(len(hic_feat_names)):
@@ -755,6 +757,8 @@ class EmbeddingVisualizer(TrainingPlugin):
                                 col += int(pixel_name.split('-')[-1])
                             try:
                                 celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
+                                celltype_original_mat[row, col] = celltype_original_pixels[:, pixel_i].mean()
+                                celltype_original_mat[col, row] = celltype_original_mat[row, col]
                                 celltype_mat[col, row] = celltype_mat[row, col]
                                 celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
                                 celltype_std_mat[col, row] = celltype_std_mat[row, col]
@@ -769,7 +773,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                         axs[1][celltype_i].set_xticks([])
                         axs[1][celltype_i].set_yticks([])
                         # compute celltype attention correlation
-                        celltype_corr, _ = pearsonr(mean_attn.flatten(), celltype_mat.flatten())
+                        celltype_corr, _ = pearsonr(mean_attn.flatten(), celltype_original_mat.flatten())
                         celltype_gene_attention_corrs[celltype + '_' + g] = celltype_corr
                         print(f'{celltype} attention correlation: {celltype_corr}')
 
