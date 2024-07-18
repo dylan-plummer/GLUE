@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import PowerNorm
 from adjustText import adjust_text
 from scipy.stats import pearsonr
+from scipy.special import softmax
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import adjusted_rand_score, accuracy_score, balanced_accuracy_score, confusion_matrix, f1_score, silhouette_score
@@ -263,7 +264,8 @@ class EmbeddingVisualizer(TrainingPlugin):
             features_ad: ad.AnnData,
             latent_dim=64,
             prefix='pretrain',
-            out_dir: str = 'tmp_imgs'
+            out_dir: str = 'tmp_imgs',
+            save_interval: int = 100
     ) -> None:
         super().__init__()
         self.rna = rna
@@ -290,6 +292,7 @@ class EmbeddingVisualizer(TrainingPlugin):
         
         self.prefix = prefix
         self.out_dir = out_dir
+        self.save_interval = save_interval
         os.makedirs(self.out_dir, exist_ok=True)
 
     def construct_matrix_from_locus(self, locus):
@@ -308,7 +311,7 @@ class EmbeddingVisualizer(TrainingPlugin):
         @train_engine.on(EPOCH_COMPLETED)  # pylint: disable=not-callable
         def _():
             epoch = train_engine.state.epoch
-            save_interval = 5
+            save_interval = self.save_interval
             if epoch % save_interval == 0:
                 save_i = int(epoch // save_interval)  # for animation
                 # get hic embeddings
@@ -429,8 +432,8 @@ class EmbeddingVisualizer(TrainingPlugin):
                 if 'Alpha' in self.hic.obs['celltype'].unique() or 'Beta' in self.hic.obs['celltype'].unique():
                     example_genes = ['INS', 'GCG', 'CEL', 'LOXL4', 'WFS1']
                 else:
-                    example_genes = ['NR2F1', 'CNTN4', 'SYT1', 'GAD1', 'GAD2']
-                    #example_genes = ['GAD2']
+                    example_genes = []
+                    #example_genes = ['GAD2', 'GAD1']
 
                 heatmap_out_dir = f'{self.out_dir}/heatmaps'
                 celltype_heatmaps_out_dir = f'{self.out_dir}/celltype_heatmaps'
@@ -546,6 +549,12 @@ class EmbeddingVisualizer(TrainingPlugin):
                         gene_neighborhood.append(self.hic.var.iloc[bin_idx + k].name)
                         gene_neighborhood.append(self.hic.var.iloc[bin_idx - k].name)
                     for node in self.graph.neighbors(g):
+                        try:
+                            neighbor_chrom = self.rna.var.loc[node]['chrom']
+                            if neighbor_chrom != locus['chrom']:
+                                continue
+                        except KeyError:
+                            pass
                         if node in self.vertices:
                             gene_neighborhood.append(node)
                             for neighbor in self.graph.neighbors(node):
@@ -561,16 +570,17 @@ class EmbeddingVisualizer(TrainingPlugin):
                     gene_graph = nx.Graph(self.graph.subgraph(gene_neighborhood))
                     # remove self loops
                     gene_graph.remove_edges_from(nx.selfloop_edges(gene_graph))
-                    fig, ax = plt.subplots()
-                    graph_pos = nx.spring_layout(gene_graph)
-                    nx.draw_networkx_nodes(gene_graph, pos=graph_pos, nodelist=neighborhood_ad.obs[neighborhood_ad.obs['type'] == 'RNA'].index, node_color='lightgreen', node_size=100)
-                    nx.draw_networkx_nodes(gene_graph, pos=graph_pos, nodelist=neighborhood_ad.obs[neighborhood_ad.obs['type'] == 'Hi-C'].index, node_color='red', node_size=50)
-                    nx.draw_networkx_edges(gene_graph, pos=graph_pos, edge_color='gray')
-                    nx.draw_networkx_labels(gene_graph, pos=graph_pos, font_size=8, font_color='black')
-                    # turn off ax grid
-                    ax.grid(False)
-                    plt.savefig(f'{gene_graph_dir}/{self.prefix}_graph_{g}_{save_i}.png')
-                    plt.close()
+                    if epoch == save_interval:  # only save graph once
+                        fig, ax = plt.subplots()
+                        graph_pos = nx.spring_layout(gene_graph)
+                        nx.draw_networkx_nodes(gene_graph, pos=graph_pos, nodelist=neighborhood_ad.obs[neighborhood_ad.obs['type'] == 'RNA'].index, node_color='lightgreen', node_size=100)
+                        nx.draw_networkx_nodes(gene_graph, pos=graph_pos, nodelist=neighborhood_ad.obs[neighborhood_ad.obs['type'] == 'Hi-C'].index, node_color='red', node_size=50)
+                        nx.draw_networkx_edges(gene_graph, pos=graph_pos, edge_color='gray')
+                        nx.draw_networkx_labels(gene_graph, pos=graph_pos, font_size=8, font_color='black')
+                        # turn off ax grid
+                        ax.grid(False)
+                        plt.savefig(f'{gene_graph_dir}/{self.prefix}_graph_{g}_{save_i}.png')
+                        plt.close()
                     # first visualize pca and umap of only bins and genes
                     x_pca = PCA(n_components=2).fit_transform(neighborhood_ad.X)
                     neighborhood_ad.obsm['X_pca'] = x_pca
@@ -628,6 +638,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                     attn_out_dir = f'{gene_out_dir}/attn'
                     os.makedirs(attn_out_dir, exist_ok=True)
                     mean_attn = np.mean(attn_mats, axis=0)
+                    max_attn = np.max(attn_mats, axis=0)
                     std_mat = np.std(attn_mats, axis=0)
                     strata_mat = np.argmax(attn_mats, axis=0)
                     fig, axs = plt.subplots(1, 3, figsize=(15, 5))
@@ -636,11 +647,11 @@ class EmbeddingVisualizer(TrainingPlugin):
                     axs[0].set_xticks([])
                     axs[0].set_yticks([])
                     axs[0].set_title('Mean Attention')
-                    sns.heatmap(std_mat, ax=axs[1], cmap='Reds', square=True, cbar=True)
+                    sns.heatmap(max_attn, ax=axs[1], cmap='bwr', square=True, cbar=True, center=0)
                     axs[1].grid(False)
                     axs[1].set_xticks([])
                     axs[1].set_yticks([])
-                    axs[1].set_title('Std Attention')
+                    axs[1].set_title('Max Attention')
                     sns.heatmap(strata_mat, ax=axs[2], cmap='jet', square=True, cbar=True, vmin=0, vmax=n_strata)
                     axs[2].grid(False)
                     axs[2].set_xticks([])
@@ -728,7 +739,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                     plt.close()
 
                     # compute correlation with mean attention
-                    mean_attn_corr, _ = pearsonr(mean_attn.flatten(), mat.flatten())
+                    mean_attn_corr, _ = pearsonr(softmax(max_attn, axis=1).flatten(), softmax(mat, axis=1).flatten())
                     gene_attention_corrs[g] = mean_attn_corr
 
                     # plot celltype heatmaps
@@ -774,7 +785,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                             axs[1][celltype_i].set_xticks([])
                             axs[1][celltype_i].set_yticks([])
                             # compute celltype attention correlation
-                            celltype_corr, _ = pearsonr(mean_attn.flatten(), celltype_mat.flatten())
+                            celltype_corr, _ = pearsonr(softmax(max_attn, axis=1).flatten(), softmax(celltype_mat, axis=1).flatten())
                             celltype_gene_attention_corrs[celltype + '_' + g] = celltype_corr
                             print(f'{celltype} attention correlation: {celltype_corr}')
                         except Exception as e:
@@ -787,6 +798,7 @@ class EmbeddingVisualizer(TrainingPlugin):
 
                     ax = sc.pl.pca(per_strata_ad, color=["type"], show=False)
                     texts = []
+                    n_labels = 0
                     for node in gene_neighborhood:
                         try:
                             node_type = per_strata_ad.obs.loc[node, 'type']
@@ -795,6 +807,9 @@ class EmbeddingVisualizer(TrainingPlugin):
                                 x_loc = per_strata_ad.obsm['X_pca'][per_strata_ad.obs.index == node, 0]
                                 y_loc = per_strata_ad.obsm['X_pca'][per_strata_ad.obs.index == node, 1]
                                 texts.append(ax.text(x_loc, y_loc, node, fontsize=10))
+                                n_labels += 1
+                                if n_labels > 10:
+                                    break
                         except Exception as e:
                             pass
                     # Label selected genes on the plot
@@ -877,6 +892,30 @@ class EmbeddingVisualizer(TrainingPlugin):
                 fig.savefig(f'{umap_out_dir}/{self.prefix}_umap_{save_i}.png')
                 plt.close()
 
+                # if rna dataset is small enough, visualize joint embeddings
+                if self.rna.shape[0] < 5000:
+                    self.hic.obs['domain'] = 'hic'
+                    self.rna.obs['domain'] = 'rna'
+                    self.rna.obs['pred_celltype'] = self.rna.obs['celltype']
+                    combined = ad.concat([self.hic, self.rna])
+                    # compute pca
+                    pca_out_dir = f'{self.out_dir}/joint/pca'
+                    os.makedirs(pca_out_dir, exist_ok=True)
+                    x_pca = PCA(n_components=2).fit_transform(combined.obsm['X_glue'])
+                    combined.obsm['X_pca'] = x_pca
+                    sc.set_figure_params()
+                    fig = sc.pl.pca(combined, color=["celltype", "pred_celltype", "domain"], ncols=3, wspace=wspace, return_fig=True)
+                    fig.savefig(f'{pca_out_dir}/{self.prefix}_pca_joint_{save_i}.png')
+                    plt.close()
+                    sc.pp.neighbors(combined, use_rep="X_glue", metric="cosine")
+                    sc.tl.umap(combined)
+                    joint_out_dir = f'{self.out_dir}/joint/umap'
+                    os.makedirs(joint_out_dir, exist_ok=True)
+                    fig = sc.pl.umap(combined, color=["celltype", "pred_celltype", "domain"], ncols=3, wspace=wspace, return_fig=True)
+                    fig.savefig(f'{joint_out_dir}/{self.prefix}_umap_joint_{save_i}.png')
+                    plt.close()
+                    
+
                 
                 # map celltypes to integers
                 celltypes = list(sorted(self.hic.obs['celltype'].unique())) + ['Other']
@@ -904,9 +943,22 @@ class EmbeddingVisualizer(TrainingPlugin):
                 ari_leiden = adjusted_rand_score(self.hic.obs['celltype_int'], self.hic.obs['leiden'])
                 ari_kmeans = adjusted_rand_score(self.hic.obs['celltype_int'], self.hic.obs['agglomerative'])
                 # measure silhouette score
-                sil_score_leiden = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['leiden'])
-                sil_score_kmeans = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['agglomerative'])
-                sil_score_joint = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['pred_celltype_int'])
+                try:
+                    sil_score_leiden = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['leiden'])
+                except ValueError:  # not enough clusters
+                    sil_score_leiden = 0
+                try:
+                    sil_score_kmeans = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['agglomerative'])
+                except ValueError:  # not enough clusters
+                    sil_score_kmeans = 0
+                try:
+                    sil_score_joint = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['pred_celltype_int'])
+                except ValueError:  # not enough clusters
+                    sil_score_joint = 0
+                try:
+                    sil_celltype = silhouette_score(self.hic.obsm['X_glue'], self.hic.obs['celltype_int'])
+                except ValueError:  # not enough clusters
+                    sil_celltype = 0
 
                 # measure ari in joint embedding space (usually better than in Hi-C only space)
                 ari_joint = adjusted_rand_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'])
@@ -918,6 +970,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                 val_accuracy = 0
                 val_balanced_accuracy = 0
                 val_ari = 0
+                val_celltype_asw = 0
                 if self.alpha_beta_val:
                     sorted_hic = self.hic[self.hic.obs_names.str.startswith('alpha_') | self.hic.obs_names.str.startswith('beta_')]
                     sorted_rna = self.rna[self.rna.obs['celltype'].isin(['Alpha', 'Beta'])]
@@ -931,7 +984,8 @@ class EmbeddingVisualizer(TrainingPlugin):
                     val_accuracy = accuracy_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
                     val_balanced_accuracy = balanced_accuracy_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
                     val_ari = adjusted_rand_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
-                    self.logger.info(f"Val Accuracy (joint): {val_accuracy:.2f}, Val Balanced Accuracy (joint): {val_balanced_accuracy:.2f}, Val ARI (joint): {val_ari:.2f}")
+                    val_celltype_asw = silhouette_score(sorted_hic.obsm['X_glue'], sorted_hic.obs['celltype_int'])
+                    self.logger.info(f"Val Accuracy (joint): {val_accuracy:.2f}, Val Balanced Accuracy (joint): {val_balanced_accuracy:.2f}, Val ARI (joint): {val_ari:.2f}, Val Celltype ASW: {val_celltype_asw:.2f}")
                     # replot
                     sorted_pca_out_dir = f'{self.out_dir}/pca_sorted'
                     os.makedirs(sorted_pca_out_dir, exist_ok=True)
@@ -1024,12 +1078,14 @@ class EmbeddingVisualizer(TrainingPlugin):
                             f"val_accuracy_{self.prefix}": val_accuracy,
                             f"val_balanced_accuracy_{self.prefix}": val_balanced_accuracy,
                             f"val_ari_{self.prefix}": val_ari,
+                            f"val_celltype_asw_{self.prefix}": val_celltype_asw,
                             f"avg_paired_dist_{self.prefix}": avg_paired_dist,
                             f"avg_corr_{self.prefix}": avg_corr,
                             f"avg_expression_corr_{self.prefix}": avg_paired_expr_corr,
                             f"silhouette_leiden_{self.prefix}": sil_score_leiden,
                             f"silhouette_kmeans_{self.prefix}": sil_score_kmeans,
                             f"silhouette_joint_{self.prefix}": sil_score_joint,
+                            f"silhouette_celltype_{self.prefix}": sil_celltype,
                            "epoch": epoch}, step=epoch)
                 wandb.log({**gene_attention_corrs, **celltype_gene_attention_corrs})
                 

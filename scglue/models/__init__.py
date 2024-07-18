@@ -238,7 +238,8 @@ def fit_SCGLUE(
                                         graph, sorted(graph.nodes),
                                         node_attr_anndata,
                                         latent_dim=init_kws['latent_dim'],
-                                        prefix='pretrain')
+                                        prefix='pretrain',
+                                        save_interval=fit_kws.get('save_interval', 10))
     pretrain.fit(adatas, graph, **pretrain_fit_kws, plugins=[embedding_viz])
     if "directory" in pretrain_fit_kws:
         pretrain.save(os.path.join(pretrain_fit_kws["directory"], "pretrain.dill"))

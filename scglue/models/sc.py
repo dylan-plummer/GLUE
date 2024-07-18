@@ -464,6 +464,7 @@ class HiCDataEncoderGraphConv(glue.DataEncoder):
             self.layer_norms.append(torch.nn.LayerNorm(h_dim))
             self.strata_projections.append(torch.nn.Linear(len(strata_masks[strata_k]), h_dim))
         self.layer_norms = torch.nn.ModuleList(self.layer_norms)
+        self.final_layer_norm = torch.nn.LayerNorm(h_dim * len(strata_masks))
         self.strata_projections = torch.nn.ModuleList(self.strata_projections)
         self.max_strata_size = 0
         for strata in strata_masks:
@@ -506,6 +507,7 @@ class HiCDataEncoderGraphConv(glue.DataEncoder):
             x = self.layer_norms[strata_k](x)
             conv_out.append(x)
         ptr = torch.concat(conv_out, dim=1)
+        ptr = self.final_layer_norm(ptr)
         for layer in range(self.h_depth):
             ptr = getattr(self, f"linear_{layer}")(ptr)
             ptr = getattr(self, f"act_{layer}")(ptr)
