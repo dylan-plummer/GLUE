@@ -445,7 +445,8 @@ class HiCDataEncoderGraphConv(glue.DataEncoder):
                  strata_masks: list = []) -> None:
         super().__init__()
         self.h_depth = h_depth
-        ptr_dim = h_dim * len(strata_masks)
+        #ptr_dim = h_dim * len(strata_masks)
+        ptr_dim = in_features
         for layer in range(self.h_depth):
             setattr(self, f"linear_{layer}", torch.nn.Linear(ptr_dim, h_dim))
             setattr(self, f"act_{layer}", torch.nn.LeakyReLU(negative_slope=0.2))
@@ -457,15 +458,16 @@ class HiCDataEncoderGraphConv(glue.DataEncoder):
         self.conv = HiCGraphConv()
         self.strata_masks = strata_masks
         #self.strata_idxs = torch.nn.ParameterList([torch.nn.Parameter(torch.as_tensor(s), requires_grad=False) for s in strata_masks])
-        self.layer_norms = []
-        self.strata_projections = []
-        for strata_k in range(len(strata_masks)):
-            #self.strata_idxs.append(torch.as_tensor(strata_masks[strata_k], device='cuda'))
-            self.layer_norms.append(torch.nn.LayerNorm(h_dim))
-            self.strata_projections.append(torch.nn.Linear(len(strata_masks[strata_k]), h_dim))
-        self.layer_norms = torch.nn.ModuleList(self.layer_norms)
-        self.final_layer_norm = torch.nn.LayerNorm(h_dim * len(strata_masks))
-        self.strata_projections = torch.nn.ModuleList(self.strata_projections)
+        # self.layer_norms = []
+        # self.strata_projections = []
+        # for strata_k in range(len(strata_masks)):
+        #     #self.strata_idxs.append(torch.as_tensor(strata_masks[strata_k], device='cuda'))
+        #     self.layer_norms.append(torch.nn.LayerNorm(h_dim))
+        #     self.strata_projections.append(torch.nn.Linear(len(strata_masks[strata_k]), h_dim))
+        # self.layer_norms = torch.nn.ModuleList(self.layer_norms)
+        #self.
+        #self.final_layer_norm = torch.nn.LayerNorm(h_dim * len(strata_masks))
+        #self.strata_projections = torch.nn.ModuleList(self.strata_projections)
         self.max_strata_size = 0
         for strata in strata_masks:
             self.max_strata_size = max(self.max_strata_size, len(strata))
@@ -490,24 +492,24 @@ class HiCDataEncoderGraphConv(glue.DataEncoder):
             l = self.compute_l(x)
             ptr = self.normalize(x, l)
          
-        conv_out = []
-        for strata_k in range(len(self.strata_masks)):
-            x = ptr[:, self.strata_masks[strata_k]]
-            # for target_strata_k in range(len(self.strata_masks)):
-            #     if target_strata_k == strata_k:  # skip self-loops
-            #         continue
-            #     if len(self.strata_masks[target_strata_k]) < 1:
-            #         continue
-            #     source_idxs = self.strata_idxs[target_strata_k]  # source indices of all strata_k bins
-            #     target_idxs = torch.clip(source_idxs + target_strata_k - strata_k, 0, ptr.shape[1] - 1)  # targets are the same as sources, but shifted by the number of bins
-            #     eidx = torch.stack([source_idxs, target_idxs], dim=0)
-            #     x += self.conv(ptr, eidx)[:, self.strata_masks[strata_k]]
-            # x /= len(self.strata_masks) - 1
-            x = self.strata_projections[strata_k](x)
-            x = self.layer_norms[strata_k](x)
-            conv_out.append(x)
-        ptr = torch.concat(conv_out, dim=1)
-        ptr = self.final_layer_norm(ptr)
+        # conv_out = []
+        # for strata_k in range(len(self.strata_masks)):
+        #     x = ptr[:, self.strata_masks[strata_k]]
+        #     # for target_strata_k in range(len(self.strata_masks)):
+        #     #     if target_strata_k == strata_k:  # skip self-loops
+        #     #         continue
+        #     #     if len(self.strata_masks[target_strata_k]) < 1:
+        #     #         continue
+        #     #     source_idxs = self.strata_idxs[target_strata_k]  # source indices of all strata_k bins
+        #     #     target_idxs = torch.clip(source_idxs + target_strata_k - strata_k, 0, ptr.shape[1] - 1)  # targets are the same as sources, but shifted by the number of bins
+        #     #     eidx = torch.stack([source_idxs, target_idxs], dim=0)
+        #     #     x += self.conv(ptr, eidx)[:, self.strata_masks[strata_k]]
+        #     # x /= len(self.strata_masks) - 1
+        #     x = self.strata_projections[strata_k](x)
+        #     x = self.layer_norms[strata_k](x)
+        #     conv_out.append(x)
+        # ptr = torch.concat(conv_out, dim=1)
+        #ptr = self.final_layer_norm(ptr)
         for layer in range(self.h_depth):
             ptr = getattr(self, f"linear_{layer}")(ptr)
             ptr = getattr(self, f"act_{layer}")(ptr)

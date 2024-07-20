@@ -265,7 +265,7 @@ class EmbeddingVisualizer(TrainingPlugin):
             latent_dim=64,
             prefix='pretrain',
             out_dir: str = 'tmp_imgs',
-            save_interval: int = 100
+            save_interval: int = 10
     ) -> None:
         super().__init__()
         self.rna = rna

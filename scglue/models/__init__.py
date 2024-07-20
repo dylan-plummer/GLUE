@@ -283,7 +283,9 @@ def fit_SCGLUE(
                                         adatas['hic'], pretrain.modalities['hic'],
                                         graph, sorted(graph.nodes), 
                                         node_attr_anndata,
-                                        prefix='finetune')
+                                        latent_dim=init_kws['latent_dim'],
+                                        prefix='finetune',
+                                        save_interval=fit_kws.get('save_interval', 10))
     finetune.fit(adatas, graph, **finetune_fit_kws, plugins=[embedding_viz])
     if "directory" in finetune_fit_kws:
         finetune.save(os.path.join(finetune_fit_kws["directory"], "fine-tune.dill"))

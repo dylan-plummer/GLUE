@@ -1006,7 +1006,8 @@ class SCGLUEModel(Model):
             max_epochs: int = AUTO, patience: Optional[int] = AUTO,
             reduce_lr_patience: Optional[int] = AUTO,
             wait_n_lrs: int = 1, directory: Optional[os.PathLike] = None,
-            plugins: Optional[Mapping[str, ignite.engine.Engine]] = None
+            plugins: Optional[Mapping[str, ignite.engine.Engine]] = None,
+            save_interval: int = 100
     ) -> None:
         r"""
         Fit model on given datasets
