@@ -206,7 +206,7 @@ class LRScheduler(TrainingPlugin):
 
     def __init__(
             self, *optims: torch.optim.Optimizer, monitor: str = None,
-            patience: int = None, burnin: int = 0
+            patience: int = None, burnin: int = 0, factor: float = 0.5
     ) -> None:
         super().__init__()
         if monitor is None:
@@ -215,7 +215,7 @@ class LRScheduler(TrainingPlugin):
         if patience is None:
             raise ValueError("`patience` must be specified!")
         self.schedulers = [
-            ReduceLROnPlateau(optim, patience=patience, verbose=True)
+            ReduceLROnPlateau(optim, patience=patience, verbose=True, factor=factor)
             for optim in optims
         ]
         # self.schedulers = [
@@ -430,10 +430,11 @@ class EmbeddingVisualizer(TrainingPlugin):
                     self.rna.obsm['X_pred_hic'] = rna_pred_hic
 
                 if 'Alpha' in self.hic.obs['celltype'].unique() or 'Beta' in self.hic.obs['celltype'].unique():
-                    example_genes = ['INS', 'GCG', 'CEL', 'LOXL4', 'WFS1']
+                    # example_genes = ['INS', 'GCG', 'CEL', 'LOXL4', 'WFS1']
+                    example_genes = ['GCG']
                 else:
                     example_genes = []
-                    #example_genes = ['GAD2', 'GAD1']
+                    example_genes = ['Gad1', 'Gad2', 'Rorb']
 
                 heatmap_out_dir = f'{self.out_dir}/heatmaps'
                 celltype_heatmaps_out_dir = f'{self.out_dir}/celltype_heatmaps'
@@ -444,9 +445,27 @@ class EmbeddingVisualizer(TrainingPlugin):
                 net.train()
 
                 # visualize some params
+                params_out_dir = f'{self.out_dir}/params'
+                os.makedirs(params_out_dir, exist_ok=True)
+                try:
+                    import torch.nn.functional as F
+                    strata_weights = F.softmax(net.u2x['hic'].strata_weights, dim=0)
+                    strata_weights = strata_weights.detach().cpu().numpy()
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    ax.plot(strata_weights)
+                    ax.set_title('Strata weights')
+                    ax.set_xlabel('Strata')
+                    ax.set_ylabel('Weight')
+                    ax.set_xticks(range(n_strata))
+                    ax.set_xticklabels(range(1, n_strata + 1))
+                    plt.savefig(f'{params_out_dir}/{self.prefix}_strata_weights_{save_i}.png')
+                    plt.close()
+                except Exception as e:
+                    print(e)
+                    pass
+
                 try:  # in case we are running an experiment without key conv params
-                    params_out_dir = f'{self.out_dir}/params'
-                    os.makedirs(params_out_dir, exist_ok=True)
+                    
                     decoder = net.u2x['hic']
                     key_conv_weights = []
                     for layer in decoder.key_convs:
@@ -464,7 +483,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                     order = linkage.dendrogram_row.reordered_ind
                     for i in range(n_plots):
                         ax = axs[i]
-                        sns.heatmap(key_conv_weights[order, i + 1, :], ax=ax, cmap='coolwarm', center=0, vmin=vmin, vmax=vmax, cbar=i == n_plots - 1)
+                        sns.heatmap(key_conv_weights[:, i + 1, :], ax=ax, cmap='coolwarm', center=0, vmin=vmin, vmax=vmax, cbar=i == n_plots - 1)
                         # remove ticks labels and grid
                         ax.set_xticklabels([])
                         ax.set_yticklabels([])
@@ -522,319 +541,322 @@ class EmbeddingVisualizer(TrainingPlugin):
                 graph_out_dir = f'{self.out_dir}/loop_graph'
                 gene_attention_corrs = {}
                 celltype_gene_attention_corrs = {}
-                for g in example_genes:
-                    try:
-                        locus = self.rna.var.loc[g]
-                    except KeyError:
+                try:
+                    for g in example_genes:
                         try:
-                            locus = self.rna.var.loc[g.lower().capitalize()]
+                            locus = self.rna.var.loc[g]
                         except KeyError:
-                            continue
-                    if g not in self.vertices:
-                        if g.lower().capitalize() not in self.vertices:
-                            continue
-                        else:
-                            g = g.lower().capitalize()
-                    gene_out_dir = f'{graph_out_dir}/{g}'
-                    gene_graph_dir = f'{gene_out_dir}/graph'
-                    gene_out_dir_pca = f'{gene_out_dir}/pca'
-                    gene_out_dir_umap = f'{gene_out_dir}/umap'
-                    os.makedirs(gene_out_dir_pca, exist_ok=True)
-                    os.makedirs(gene_out_dir_umap, exist_ok=True)
-                    os.makedirs(gene_graph_dir, exist_ok=True)
-                    gene_neighborhood = [g]
-                    bin_idx = get_closest_peak_to_gene(g, self.rna, self.hic.var)
-                    n_strata = len(net.u2x['hic'].key_convs)
-                    for k in range(n_strata + 1):
-                        gene_neighborhood.append(self.hic.var.iloc[bin_idx + k].name)
-                        gene_neighborhood.append(self.hic.var.iloc[bin_idx - k].name)
-                    for node in self.graph.neighbors(g):
-                        try:
-                            neighbor_chrom = self.rna.var.loc[node]['chrom']
-                            if neighbor_chrom != locus['chrom']:
+                            try:
+                                locus = self.rna.var.loc[g.lower().capitalize()]
+                            except KeyError:
                                 continue
-                        except KeyError:
-                            pass
-                        if node in self.vertices:
-                            gene_neighborhood.append(node)
-                            for neighbor in self.graph.neighbors(node):
-                                if neighbor in self.vertices:
-                                    gene_neighborhood.append(neighbor)
-                                    for anchor in self.graph.neighbors(neighbor):
-                                        if anchor in self.vertices:
-                                            gene_neighborhood.append(anchor)
-                    
-                    gene_neighborhood = list(set(gene_neighborhood))
-                    neighborhood_ad = self.features_ad[self.features_ad.obs.index.isin(gene_neighborhood)].copy()
-                    # visualize graph with edges
-                    gene_graph = nx.Graph(self.graph.subgraph(gene_neighborhood))
-                    # remove self loops
-                    gene_graph.remove_edges_from(nx.selfloop_edges(gene_graph))
-                    if epoch == save_interval:  # only save graph once
-                        fig, ax = plt.subplots()
-                        graph_pos = nx.spring_layout(gene_graph)
-                        nx.draw_networkx_nodes(gene_graph, pos=graph_pos, nodelist=neighborhood_ad.obs[neighborhood_ad.obs['type'] == 'RNA'].index, node_color='lightgreen', node_size=100)
-                        nx.draw_networkx_nodes(gene_graph, pos=graph_pos, nodelist=neighborhood_ad.obs[neighborhood_ad.obs['type'] == 'Hi-C'].index, node_color='red', node_size=50)
-                        nx.draw_networkx_edges(gene_graph, pos=graph_pos, edge_color='gray')
-                        nx.draw_networkx_labels(gene_graph, pos=graph_pos, font_size=8, font_color='black')
-                        # turn off ax grid
-                        ax.grid(False)
-                        plt.savefig(f'{gene_graph_dir}/{self.prefix}_graph_{g}_{save_i}.png')
-                        plt.close()
-                    # first visualize pca and umap of only bins and genes
-                    x_pca = PCA(n_components=2).fit_transform(neighborhood_ad.X)
-                    neighborhood_ad.obsm['X_pca'] = x_pca
-                    #sc.set_figure_params()
-                    fig = sc.pl.pca(neighborhood_ad, color=["chrom", "type", "pos", "degree"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
-                    fig.savefig(f'{gene_out_dir_pca}/{self.prefix}_pca_features_{save_i}.png')
-                    plt.close()
-                    try:
-                        sc.pp.neighbors(neighborhood_ad, metric="cosine")
-                        sc.tl.umap(neighborhood_ad)
-                        fig = sc.pl.umap(neighborhood_ad, color=["chrom", "type", "pos", "degree"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
-                        fig.savefig(f'{gene_out_dir_umap}/{self.prefix}_umap_features_{save_i}.png')
-                        plt.close()
-                    except Exception as e:
-                        print(e)
-                        pass
-                    # now transform features at each strata
-                    per_strata_out_dir_pca = f'{gene_out_dir}/pca_strata'
-                    per_strata_out_dir_umap = f'{gene_out_dir}/umap_strata'
-                    per_strata_out_dir_graph = f'{gene_out_dir}/graph_strata'
-                    os.makedirs(per_strata_out_dir_pca, exist_ok=True)
-                    os.makedirs(per_strata_out_dir_umap, exist_ok=True)
-                    os.makedirs(per_strata_out_dir_graph, exist_ok=True)
-                    n_strata = len(net.u2x['hic'].key_convs)
-                    neighborhood_ad.obs['strata'] = 0
-                    per_strata_ads = [neighborhood_ad]
-                    attn_mats = []
-                    for k in range(n_strata):
-                        # get only hi-c features
-                        strata_ad = self.features_ad[self.features_ad.obs['type'] == 'Hi-C', :].copy()
-                        strata_ad_mask = strata_ad.obs.index.isin(neighborhood_ad.obs.index)
-                        v = strata_ad.X
-                        v = torch.as_tensor(v, device=net.device)
-                        #key_conv = net.u2x['hic'].key_convs[k]
-                        v = net.u2x['hic'].prenorm_layers[k](v)
-                        qk = net.u2x['hic'].key_layers[k](v)
-                        v = net.u2x['hic'].value_layers[k](v)
-                        feats = net.u2x['hic'].attn_layers[k](qk, qk, v)
-                        attn_mat = torch.matmul(qk[strata_ad_mask, :], qk[strata_ad_mask, :].T) / math.sqrt(qk[strata_ad_mask, :].shape[1])
-                        attn_mats.append(attn_mat.detach().cpu().numpy())
-                        #feats = key_conv(v.t()).t()
-                        strata_ad.X = feats.detach().cpu().numpy()
-                        strata_ad.obs['strata'] = k + 1
-                        strata_ad.obs['type'] = 'Hi-C_strata'
-                        per_strata_ads.append(strata_ad[strata_ad_mask, :])
-                    per_strata_ad = ad.concat(per_strata_ads)
-                    x_pca = PCA(n_components=2).fit_transform(per_strata_ad.X)
-                    per_strata_ad.obsm['X_pca'] = x_pca
-                    sc.set_figure_params()
-                    fig = sc.pl.pca(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
-                    fig.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_pca_features_{save_i}.png')
-                    plt.close()
-
-                    # plot attention maps
-                    attn_out_dir = f'{gene_out_dir}/attn'
-                    os.makedirs(attn_out_dir, exist_ok=True)
-                    mean_attn = np.mean(attn_mats, axis=0)
-                    max_attn = np.max(attn_mats, axis=0)
-                    std_mat = np.std(attn_mats, axis=0)
-                    strata_mat = np.argmax(attn_mats, axis=0)
-                    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-                    sns.heatmap(mean_attn, ax=axs[0], cmap='bwr', square=True, cbar=True, center=0)
-                    axs[0].grid(False)
-                    axs[0].set_xticks([])
-                    axs[0].set_yticks([])
-                    axs[0].set_title('Mean Attention')
-                    sns.heatmap(max_attn, ax=axs[1], cmap='bwr', square=True, cbar=True, center=0)
-                    axs[1].grid(False)
-                    axs[1].set_xticks([])
-                    axs[1].set_yticks([])
-                    axs[1].set_title('Max Attention')
-                    sns.heatmap(strata_mat, ax=axs[2], cmap='jet', square=True, cbar=True, vmin=0, vmax=n_strata)
-                    axs[2].grid(False)
-                    axs[2].set_xticks([])
-                    axs[2].set_yticks([])
-                    axs[2].set_title('Strata')
-
-                    plt.savefig(f'{attn_out_dir}/{self.prefix}_mean_attn_{g}_{save_i}.png')
-                    plt.close()
-
-                    n_rows = 4
-                    n_cols = int(n_strata // n_rows) + 1
-                    fig, ax = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 5))
-                    #sns.heatmap(mean_attn, ax=ax, cmap='Spectral_r', square=True, cbar=True, center=0)
-                    for i in range(n_strata):
-                        attn_mat = attn_mats[i]
-                        row = i // n_cols
-                        col = i % n_cols
-                        sns.heatmap(attn_mat, ax=ax[row, col], cmap='bwr', square=True, cbar=True, center=0)
-                        ax[row, col].set_title(f'Strata {i + 1}')
-                        ax[row, col].grid(False)
-                        ax[row, col].set_xticks([])
-                        ax[row, col].set_yticks([])
-                    plt.savefig(f'{attn_out_dir}/{self.prefix}_attn_{g}_{save_i}.png')
-                    plt.close()
-
-                    # compare attention maps with celltype heatmap reconstructions
-                    print(self.hic.var_names[:10])
-                    hic_neighborhood_ad = neighborhood_ad[neighborhood_ad.obs['type'] == 'Hi-C', :]
-                    print(hic_neighborhood_ad.obs.head())
-                    hic_sources = self.hic.var.apply(lambda row: f"{row['chrom']}:{row['chromStart']}-{row['chromEnd']}", axis=1)
-                    hic_mask = hic_sources.isin(hic_neighborhood_ad.obs.index)
-                    print(hic_mask.sum())
-                    #hic_mask = (self.hic.var['chrom'] == locus['chrom']) & (self.hic.var['chromStart'] >= locus['chromStart'] - heatmap_range) & (self.hic.var['chromStart'] <= locus['chromStart'] + heatmap_range)
-                    hic_feats = self.hic.var.loc[hic_mask]
-                    hic_feat_names = self.hic.var_names[hic_mask]
-                    original_pixels = self.hic.layers['counts'][:, hic_mask]
-                    pred_pixels = self.hic.obsm['X_pred_hic'][:, hic_mask]
-                    
-                    mat_size = mean_attn.shape[0]
-                    mat = np.zeros((mat_size, mat_size))
-                    std_mat = np.zeros((mat_size, mat_size))
-                    pred_mat = np.zeros((mat_size, mat_size))
-                    pred_std_mat = np.zeros((mat_size, mat_size))
-                    for pixel_i in range(len(hic_feat_names)):
-                        pixel = hic_feats.iloc[pixel_i]
-                        pixel_name = hic_feat_names[pixel_i]
-
-                        # row is integer index from hic_neighborhood_ad
-                        if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                            row = hic_neighborhood_ad.obs.index.get_loc(pixel_name[:pixel_name.rfind('-')])
-                        else:
-                            row = hic_neighborhood_ad.obs.index.get_loc(pixel_name)
-                        col = row
-                        if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                            col += int(pixel_name.split('-')[-1])
-                        try:
-                            mat[row, col] = original_pixels[:, pixel_i].mean()
-                            mat[col, row] = mat[row, col]
-                            pred_mat[row, col] = pred_pixels[:, pixel_i].mean()
-                            pred_mat[col, row] = pred_mat[row, col]
-                            std_mat[row, col] = original_pixels[:, pixel_i].std()
-                            std_mat[col, row] = std_mat[row, col]
-                            pred_std_mat[row, col] = pred_pixels[:, pixel_i].std()
-                            pred_std_mat[col, row] = pred_std_mat[row, col]
-                        except Exception as e:
-                            continue
-                    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
-                    sns.heatmap(mat, ax=axs[0][0], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
-                    axs[0][0].set_title(f'Mean Original Hi-C {g}')
-                    axs[0][0].set_xticks([])
-                    axs[0][0].set_yticks([])
-                    sns.heatmap(pred_mat, ax=axs[0][1], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
-                    axs[0][1].set_title(f'Mean Predicted Hi-C {g}')
-                    axs[0][1].set_xticks([])
-                    axs[0][1].set_yticks([])
-                    sns.heatmap(std_mat, ax=axs[1][0], cmap='Greens', square=True, cbar=False)
-                    axs[1][0].set_title(f'Original Hi-C Std {g}')
-                    axs[1][0].set_xticks([])
-                    axs[1][0].set_yticks([])
-                    sns.heatmap(pred_std_mat, ax=axs[1][1], cmap='Greens', square=True, cbar=False)
-                    axs[1][1].set_title(f'Predicted Hi-C Std {g}')
-                    axs[1][1].set_xticks([])
-                    axs[1][1].set_yticks([])
-                    plt.savefig(f'{heatmap_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
-                    plt.close()
-
-                    # compute correlation with mean attention
-                    mean_attn_corr, _ = pearsonr(softmax(max_attn, axis=1).flatten(), softmax(mat, axis=1).flatten())
-                    gene_attention_corrs[g] = mean_attn_corr
-
-                    # plot celltype heatmaps
-                    fig, axs = plt.subplots(2, len(self.rna.obs['celltype'].unique()), figsize=(6 * len(self.rna.obs['celltype'].unique()), 6))
-                    vmax = np.max(mat)
-                    for celltype_i, celltype in enumerate(sorted(self.rna.obs['celltype'].unique())):
-                        celltype_mask = self.rna.obs['celltype'] == celltype
-                        celltype_rna = self.rna[celltype_mask]
-                        #celltype_original_pixels = self.rna.layers['counts'][celltype_mask, :]
-                        try:
-                            celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
-                            celltype_mat = np.zeros((mat_size, mat_size))
-                            #celltype_original_mat = np.zeros((mat_size, mat_size))
-                            celltype_std_mat = np.zeros((mat_size, mat_size))   
-
-                            for pixel_i in range(len(hic_feat_names)):
-                                pixel = hic_feats.iloc[pixel_i]
-                                pixel_name = hic_feat_names[pixel_i]
-
-                                # row is integer index from hic_neighborhood_ad
-                                if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                                    row = hic_neighborhood_ad.obs.index.get_loc(pixel_name[:pixel_name.rfind('-')])
-                                else:
-                                    row = hic_neighborhood_ad.obs.index.get_loc(pixel_name)
-                                col = row
-                                if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                                    col += int(pixel_name.split('-')[-1])
-                                try:
-                                    celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
-                                    #celltype_original_mat[row, col] = celltype_original_pixels[:, pixel_i].mean()
-                                    #celltype_original_mat[col, row] = celltype_original_mat[row, col]
-                                    celltype_mat[col, row] = celltype_mat[row, col]
-                                    celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
-                                    celltype_std_mat[col, row] = celltype_std_mat[row, col]
-                                except Exception as e:
+                        if g not in self.vertices:
+                            if g.lower().capitalize() not in self.vertices:
+                                continue
+                            else:
+                                g = g.lower().capitalize()
+                        gene_out_dir = f'{graph_out_dir}/{g}'
+                        gene_graph_dir = f'{gene_out_dir}/graph'
+                        gene_out_dir_pca = f'{gene_out_dir}/pca'
+                        gene_out_dir_umap = f'{gene_out_dir}/umap'
+                        os.makedirs(gene_out_dir_pca, exist_ok=True)
+                        os.makedirs(gene_out_dir_umap, exist_ok=True)
+                        os.makedirs(gene_graph_dir, exist_ok=True)
+                        gene_neighborhood = [g]
+                        bin_idx = get_closest_peak_to_gene(g, self.rna, self.hic.var)
+                        n_strata = len(net.u2x['hic'].key_convs)
+                        for k in range(n_strata + 1):
+                            gene_neighborhood.append(self.hic.var.iloc[bin_idx + k].name)
+                            gene_neighborhood.append(self.hic.var.iloc[bin_idx - k].name)
+                        for node in self.graph.neighbors(g):
+                            try:
+                                neighbor_chrom = self.rna.var.loc[node]['chrom']
+                                if neighbor_chrom != locus['chrom']:
                                     continue
-                            sns.heatmap(celltype_mat, ax=axs[0][celltype_i], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False, vmin=0, vmax=vmax)
-                            axs[0][celltype_i].set_title(celltype)
-                            axs[0][celltype_i].set_xticks([])
-                            axs[0][celltype_i].set_yticks([])
-                            sns.heatmap(celltype_std_mat, ax=axs[1][celltype_i], cmap='Greens', square=True, cbar=False)
-                            axs[1][celltype_i].set_title(f'{celltype} Std')
-                            axs[1][celltype_i].set_xticks([])
-                            axs[1][celltype_i].set_yticks([])
-                            # compute celltype attention correlation
-                            celltype_corr, _ = pearsonr(softmax(max_attn, axis=1).flatten(), softmax(celltype_mat, axis=1).flatten())
-                            celltype_gene_attention_corrs[celltype + '_' + g] = celltype_corr
-                            print(f'{celltype} attention correlation: {celltype_corr}')
+                            except KeyError:
+                                pass
+                            if node in self.vertices:
+                                gene_neighborhood.append(node)
+                                for neighbor in self.graph.neighbors(node):
+                                    if neighbor in self.vertices:
+                                        gene_neighborhood.append(neighbor)
+                                        for anchor in self.graph.neighbors(neighbor):
+                                            if anchor in self.vertices:
+                                                gene_neighborhood.append(anchor)
+                        
+                        gene_neighborhood = list(set(gene_neighborhood))
+                        neighborhood_ad = self.features_ad[self.features_ad.obs.index.isin(gene_neighborhood)].copy()
+                        # visualize graph with edges
+                        gene_graph = nx.Graph(self.graph.subgraph(gene_neighborhood))
+                        # remove self loops
+                        gene_graph.remove_edges_from(nx.selfloop_edges(gene_graph))
+                        if epoch == save_interval:  # only save graph once
+                            fig, ax = plt.subplots()
+                            graph_pos = nx.spring_layout(gene_graph)
+                            nx.draw_networkx_nodes(gene_graph, pos=graph_pos, nodelist=neighborhood_ad.obs[neighborhood_ad.obs['type'] == 'RNA'].index, node_color='lightgreen', node_size=100)
+                            nx.draw_networkx_nodes(gene_graph, pos=graph_pos, nodelist=neighborhood_ad.obs[neighborhood_ad.obs['type'] == 'Hi-C'].index, node_color='red', node_size=50)
+                            nx.draw_networkx_edges(gene_graph, pos=graph_pos, edge_color='gray')
+                            nx.draw_networkx_labels(gene_graph, pos=graph_pos, font_size=8, font_color='black')
+                            # turn off ax grid
+                            ax.grid(False)
+                            plt.savefig(f'{gene_graph_dir}/{self.prefix}_graph_{g}_{save_i}.png')
+                            plt.close()
+                        # first visualize pca and umap of only bins and genes
+                        x_pca = PCA(n_components=2).fit_transform(neighborhood_ad.X)
+                        neighborhood_ad.obsm['X_pca'] = x_pca
+                        #sc.set_figure_params()
+                        fig = sc.pl.pca(neighborhood_ad, color=["chrom", "type", "pos", "degree"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
+                        fig.savefig(f'{gene_out_dir_pca}/{self.prefix}_pca_features_{save_i}.png')
+                        plt.close()
+                        try:
+                            sc.pp.neighbors(neighborhood_ad, metric="cosine")
+                            sc.tl.umap(neighborhood_ad)
+                            fig = sc.pl.umap(neighborhood_ad, color=["chrom", "type", "pos", "degree"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
+                            fig.savefig(f'{gene_out_dir_umap}/{self.prefix}_umap_features_{save_i}.png')
+                            plt.close()
                         except Exception as e:
                             print(e)
-                            continue
-
-                    plt.tight_layout()
-                    plt.savefig(f'{celltype_heatmaps_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
-                    plt.close()
-
-                    ax = sc.pl.pca(per_strata_ad, color=["type"], show=False)
-                    texts = []
-                    n_labels = 0
-                    for node in gene_neighborhood:
-                        try:
-                            node_type = per_strata_ad.obs.loc[node, 'type']
-                            # if node is a gene, draw its name
-                            if node_type == 'RNA':
-                                x_loc = per_strata_ad.obsm['X_pca'][per_strata_ad.obs.index == node, 0]
-                                y_loc = per_strata_ad.obsm['X_pca'][per_strata_ad.obs.index == node, 1]
-                                texts.append(ax.text(x_loc, y_loc, node, fontsize=10))
-                                n_labels += 1
-                                if n_labels > 10:
-                                    break
-                        except Exception as e:
                             pass
-                    # Label selected genes on the plot
-                    _ = adjust_text(
-                        texts,
-                        arrowprops=dict(arrowstyle="->", color="gray", lw=1),
-                        ax=ax,
-                    )
-                    plt.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_labeled_pca_features_{save_i}.png')
-                    plt.close()
-                    try:
-                        sc.pp.neighbors(per_strata_ad)
-                        # sc.tl.draw_graph(per_strata_ad, layout='kk')
-                        # fig = sc.pl.draw_graph(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet', edges=True, )
-                        # fig.savefig(f'{per_strata_out_dir_graph}/{self.prefix}_graph_features_{save_i}.png')
-                        # plt.close()
-
-                        sc.tl.umap(per_strata_ad)
-                        fig = sc.pl.umap(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
-                        fig.savefig(f'{per_strata_out_dir_umap}/{self.prefix}_umap_features_{save_i}.png')
+                        # now transform features at each strata
+                        per_strata_out_dir_pca = f'{gene_out_dir}/pca_strata'
+                        per_strata_out_dir_umap = f'{gene_out_dir}/umap_strata'
+                        per_strata_out_dir_graph = f'{gene_out_dir}/graph_strata'
+                        os.makedirs(per_strata_out_dir_pca, exist_ok=True)
+                        os.makedirs(per_strata_out_dir_umap, exist_ok=True)
+                        os.makedirs(per_strata_out_dir_graph, exist_ok=True)
+                        n_strata = len(net.u2x['hic'].key_convs)
+                        neighborhood_ad.obs['strata'] = 0
+                        per_strata_ads = [neighborhood_ad]
+                        attn_mats = []
+                        for k in range(n_strata):
+                            # get only hi-c features
+                            strata_ad = self.features_ad[self.features_ad.obs['type'] == 'Hi-C', :].copy()
+                            strata_ad_mask = strata_ad.obs.index.isin(neighborhood_ad.obs.index)
+                            v = strata_ad.X
+                            v = torch.as_tensor(v, device=net.device)
+                            #key_conv = net.u2x['hic'].key_convs[k]
+                            v = net.u2x['hic'].prenorm_layers[k](v)
+                            qk = net.u2x['hic'].key_layers[k](v)
+                            v = net.u2x['hic'].value_layers[k](v)
+                            feats = net.u2x['hic'].attn_layers[k](qk, qk, v)
+                            attn_mat = torch.matmul(qk[strata_ad_mask, :], qk[strata_ad_mask, :].T) / math.sqrt(qk[strata_ad_mask, :].shape[1])
+                            attn_mats.append(attn_mat.detach().cpu().numpy())
+                            #feats = key_conv(v.t()).t()
+                            strata_ad.X = feats.detach().cpu().numpy()
+                            strata_ad.obs['strata'] = k + 1
+                            strata_ad.obs['type'] = 'Hi-C_strata'
+                            per_strata_ads.append(strata_ad[strata_ad_mask, :])
+                        per_strata_ad = ad.concat(per_strata_ads)
+                        x_pca = PCA(n_components=2).fit_transform(per_strata_ad.X)
+                        per_strata_ad.obsm['X_pca'] = x_pca
+                        sc.set_figure_params()
+                        fig = sc.pl.pca(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
+                        fig.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_pca_features_{save_i}.png')
                         plt.close()
-                    except Exception as e:
-                        print(e)
-                        pass
 
+                        # plot attention maps
+                        attn_out_dir = f'{gene_out_dir}/attn'
+                        os.makedirs(attn_out_dir, exist_ok=True)
+                        mean_attn = np.mean(attn_mats, axis=0)
+                        max_attn = np.max(attn_mats, axis=0)
+                        std_mat = np.std(attn_mats, axis=0)
+                        strata_mat = np.argmax(attn_mats, axis=0)
+                        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                        sns.heatmap(mean_attn, ax=axs[0], cmap='bwr', square=True, cbar=True, center=0)
+                        axs[0].grid(False)
+                        axs[0].set_xticks([])
+                        axs[0].set_yticks([])
+                        axs[0].set_title('Mean Attention')
+                        sns.heatmap(max_attn, ax=axs[1], cmap='bwr', square=True, cbar=True, center=0)
+                        axs[1].grid(False)
+                        axs[1].set_xticks([])
+                        axs[1].set_yticks([])
+                        axs[1].set_title('Max Attention')
+                        sns.heatmap(strata_mat, ax=axs[2], cmap='jet', square=True, cbar=True, vmin=0, vmax=n_strata)
+                        axs[2].grid(False)
+                        axs[2].set_xticks([])
+                        axs[2].set_yticks([])
+                        axs[2].set_title('Strata')
+
+                        plt.savefig(f'{attn_out_dir}/{self.prefix}_mean_attn_{g}_{save_i}.png')
+                        plt.close()
+
+                        n_rows = 4
+                        n_cols = int(n_strata // n_rows) + 1
+                        fig, ax = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 5))
+                        #sns.heatmap(mean_attn, ax=ax, cmap='Spectral_r', square=True, cbar=True, center=0)
+                        for i in range(n_strata):
+                            attn_mat = attn_mats[i]
+                            row = i // n_cols
+                            col = i % n_cols
+                            sns.heatmap(attn_mat, ax=ax[row, col], cmap='bwr', square=True, cbar=True, center=0)
+                            ax[row, col].set_title(f'Strata {i + 1}')
+                            ax[row, col].grid(False)
+                            ax[row, col].set_xticks([])
+                            ax[row, col].set_yticks([])
+                        plt.savefig(f'{attn_out_dir}/{self.prefix}_attn_{g}_{save_i}.png')
+                        plt.close()
+
+                        # compare attention maps with celltype heatmap reconstructions
+                        print(self.hic.var_names[:10])
+                        hic_neighborhood_ad = neighborhood_ad[neighborhood_ad.obs['type'] == 'Hi-C', :]
+                        print(hic_neighborhood_ad.obs.head())
+                        hic_sources = self.hic.var.apply(lambda row: f"{row['chrom']}:{row['chromStart']}-{row['chromEnd']}", axis=1)
+                        hic_mask = hic_sources.isin(hic_neighborhood_ad.obs.index)
+                        print(hic_mask.sum())
+                        #hic_mask = (self.hic.var['chrom'] == locus['chrom']) & (self.hic.var['chromStart'] >= locus['chromStart'] - heatmap_range) & (self.hic.var['chromStart'] <= locus['chromStart'] + heatmap_range)
+                        hic_feats = self.hic.var.loc[hic_mask]
+                        hic_feat_names = self.hic.var_names[hic_mask]
+                        original_pixels = self.hic.layers['counts'][:, hic_mask]
+                        pred_pixels = self.hic.obsm['X_pred_hic'][:, hic_mask]
+                        
+                        mat_size = mean_attn.shape[0]
+                        mat = np.zeros((mat_size, mat_size))
+                        std_mat = np.zeros((mat_size, mat_size))
+                        pred_mat = np.zeros((mat_size, mat_size))
+                        pred_std_mat = np.zeros((mat_size, mat_size))
+                        for pixel_i in range(len(hic_feat_names)):
+                            pixel = hic_feats.iloc[pixel_i]
+                            pixel_name = hic_feat_names[pixel_i]
+
+                            # row is integer index from hic_neighborhood_ad
+                            if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                                row = hic_neighborhood_ad.obs.index.get_loc(pixel_name[:pixel_name.rfind('-')])
+                            else:
+                                row = hic_neighborhood_ad.obs.index.get_loc(pixel_name)
+                            col = row
+                            if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                                col += int(pixel_name.split('-')[-1])
+                            try:
+                                mat[row, col] = original_pixels[:, pixel_i].mean()
+                                mat[col, row] = mat[row, col]
+                                pred_mat[row, col] = pred_pixels[:, pixel_i].mean()
+                                pred_mat[col, row] = pred_mat[row, col]
+                                std_mat[row, col] = original_pixels[:, pixel_i].std()
+                                std_mat[col, row] = std_mat[row, col]
+                                pred_std_mat[row, col] = pred_pixels[:, pixel_i].std()
+                                pred_std_mat[col, row] = pred_std_mat[row, col]
+                            except Exception as e:
+                                continue
+                        fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+                        sns.heatmap(mat, ax=axs[0][0], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
+                        axs[0][0].set_title(f'Mean Original Hi-C {g}')
+                        axs[0][0].set_xticks([])
+                        axs[0][0].set_yticks([])
+                        sns.heatmap(pred_mat, ax=axs[0][1], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False)
+                        axs[0][1].set_title(f'Mean Predicted Hi-C {g}')
+                        axs[0][1].set_xticks([])
+                        axs[0][1].set_yticks([])
+                        sns.heatmap(std_mat, ax=axs[1][0], cmap='Greens', square=True, cbar=False)
+                        axs[1][0].set_title(f'Original Hi-C Std {g}')
+                        axs[1][0].set_xticks([])
+                        axs[1][0].set_yticks([])
+                        sns.heatmap(pred_std_mat, ax=axs[1][1], cmap='Greens', square=True, cbar=False)
+                        axs[1][1].set_title(f'Predicted Hi-C Std {g}')
+                        axs[1][1].set_xticks([])
+                        axs[1][1].set_yticks([])
+                        plt.savefig(f'{heatmap_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
+                        plt.close()
+
+                        # compute correlation with mean attention
+                        mean_attn_corr, _ = pearsonr(softmax(max_attn, axis=1).flatten(), softmax(mat, axis=1).flatten())
+                        gene_attention_corrs[g] = mean_attn_corr
+
+                        # plot celltype heatmaps
+                        fig, axs = plt.subplots(2, len(self.rna.obs['celltype'].unique()), figsize=(6 * len(self.rna.obs['celltype'].unique()), 6))
+                        vmax = np.max(mat)
+                        for celltype_i, celltype in enumerate(sorted(self.rna.obs['celltype'].unique())):
+                            celltype_mask = self.rna.obs['celltype'] == celltype
+                            celltype_rna = self.rna[celltype_mask]
+                            #celltype_original_pixels = self.rna.layers['counts'][celltype_mask, :]
+                            try:
+                                celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
+                                celltype_mat = np.zeros((mat_size, mat_size))
+                                #celltype_original_mat = np.zeros((mat_size, mat_size))
+                                celltype_std_mat = np.zeros((mat_size, mat_size))   
+
+                                for pixel_i in range(len(hic_feat_names)):
+                                    pixel = hic_feats.iloc[pixel_i]
+                                    pixel_name = hic_feat_names[pixel_i]
+
+                                    # row is integer index from hic_neighborhood_ad
+                                    if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                                        row = hic_neighborhood_ad.obs.index.get_loc(pixel_name[:pixel_name.rfind('-')])
+                                    else:
+                                        row = hic_neighborhood_ad.obs.index.get_loc(pixel_name)
+                                    col = row
+                                    if pixel_name[-2] == '-' or pixel_name[-3] == '-':
+                                        col += int(pixel_name.split('-')[-1])
+                                    try:
+                                        celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
+                                        #celltype_original_mat[row, col] = celltype_original_pixels[:, pixel_i].mean()
+                                        #celltype_original_mat[col, row] = celltype_original_mat[row, col]
+                                        celltype_mat[col, row] = celltype_mat[row, col]
+                                        celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
+                                        celltype_std_mat[col, row] = celltype_std_mat[row, col]
+                                    except Exception as e:
+                                        continue
+                                sns.heatmap(celltype_mat, ax=axs[0][celltype_i], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False, vmin=0, vmax=vmax)
+                                axs[0][celltype_i].set_title(celltype)
+                                axs[0][celltype_i].set_xticks([])
+                                axs[0][celltype_i].set_yticks([])
+                                sns.heatmap(celltype_std_mat, ax=axs[1][celltype_i], cmap='Greens', square=True, cbar=False)
+                                axs[1][celltype_i].set_title(f'{celltype} Std')
+                                axs[1][celltype_i].set_xticks([])
+                                axs[1][celltype_i].set_yticks([])
+                                # compute celltype attention correlation
+                                celltype_corr, _ = pearsonr(softmax(max_attn, axis=1).flatten(), softmax(celltype_mat, axis=1).flatten())
+                                celltype_gene_attention_corrs[celltype + '_' + g] = celltype_corr
+                                print(f'{celltype} attention correlation: {celltype_corr}')
+                            except Exception as e:
+                                print(e)
+                                continue
+
+                        plt.tight_layout()
+                        plt.savefig(f'{celltype_heatmaps_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
+                        plt.close()
+
+                        ax = sc.pl.pca(per_strata_ad, color=["type"], show=False)
+                        texts = []
+                        n_labels = 0
+                        for node in gene_neighborhood:
+                            try:
+                                node_type = per_strata_ad.obs.loc[node, 'type']
+                                # if node is a gene, draw its name
+                                if node_type == 'RNA':
+                                    x_loc = per_strata_ad.obsm['X_pca'][per_strata_ad.obs.index == node, 0]
+                                    y_loc = per_strata_ad.obsm['X_pca'][per_strata_ad.obs.index == node, 1]
+                                    texts.append(ax.text(x_loc, y_loc, node, fontsize=10))
+                                    n_labels += 1
+                                    if n_labels > 10:
+                                        break
+                            except Exception as e:
+                                pass
+                        # Label selected genes on the plot
+                        _ = adjust_text(
+                            texts,
+                            arrowprops=dict(arrowstyle="->", color="gray", lw=1),
+                            ax=ax,
+                        )
+                        plt.savefig(f'{per_strata_out_dir_pca}/{self.prefix}_labeled_pca_features_{save_i}.png')
+                        plt.close()
+                        try:
+                            sc.pp.neighbors(per_strata_ad)
+                            # sc.tl.draw_graph(per_strata_ad, layout='kk')
+                            # fig = sc.pl.draw_graph(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet', edges=True, )
+                            # fig.savefig(f'{per_strata_out_dir_graph}/{self.prefix}_graph_features_{save_i}.png')
+                            # plt.close()
+
+                            sc.tl.umap(per_strata_ad)
+                            fig = sc.pl.umap(per_strata_ad, color=["type", "pos", "degree", "strata"], ncols=2, wspace=0.5, return_fig=True, color_map='jet')
+                            fig.savefig(f'{per_strata_out_dir_umap}/{self.prefix}_umap_features_{save_i}.png')
+                            plt.close()
+                        except Exception as e:
+                            print(e)
+                            pass
+                except Exception as e:
+                    print(e)
+                    pass                    
 
 
 
@@ -1087,7 +1109,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                             f"silhouette_joint_{self.prefix}": sil_score_joint,
                             f"silhouette_celltype_{self.prefix}": sil_celltype,
                            "epoch": epoch}, step=epoch)
-                wandb.log({**gene_attention_corrs, **celltype_gene_attention_corrs})
+                #wandb.log({**gene_attention_corrs, **celltype_gene_attention_corrs})
                 
 
             

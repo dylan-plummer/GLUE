@@ -57,7 +57,7 @@ register_prob_model("ZILN", sc.VanillaDataEncoder, sc.ZILNDataDecoder)
 register_prob_model("NB", sc.NBDataEncoder, sc.NBDataDecoder)
 register_prob_model("ZINB", sc.NBDataEncoder, sc.ZINBDataDecoder)
 register_prob_model("HiCNB", sc.HiCDataEncoder, sc.StratifiedNBDataDecoder)  # same encoder but strata-specific decoder
-register_prob_model("HiCZINB", sc.HiCDataEncoderGraphConv, sc.StratifiedZINBDataDecoder)  # same encoder but strata-specific decoder
+register_prob_model("HiCZINB", sc.HiCDataEncoder, sc.StratifiedZINBDataDecoder)  # same encoder but strata-specific decoder
 
 
 #----------------------------- Network definition ------------------------------
@@ -191,7 +191,7 @@ class SCGLUETrainer(GLUETrainer):
     def __init__(
             self, net: SCGLUE, lam_data: float = None, lam_kl: float = None,
             lam_graph: float = None, lam_align: float = None,
-            lam_sup: float = None, normalize_u: bool = None,
+            lam_sup: float = None, lam_cycle: float = None, normalize_u: bool = None,
             modality_weight: Mapping[str, float] = None,
             optim: str = None, lr: float = None, **kwargs
     ) -> None:
@@ -205,6 +205,7 @@ class SCGLUETrainer(GLUETrainer):
             if locals()[required_kwarg] is None:
                 raise ValueError(f"`{required_kwarg}` must be specified!")
         self.lam_sup = lam_sup
+        self.lam_cycle = lam_cycle
         self.normalize_u = normalize_u
         self.freeze_u = False
         if net.u2c:
@@ -357,6 +358,7 @@ class SCGLUETrainer(GLUETrainer):
         g_nll = (g_nll_pn[0] / max(n_neg, 1) + g_nll_pn[1] / max(n_pos, 1)) / avgc
         g_kl = D.kl_divergence(v, prior).sum(dim=1).mean() / vsamp.shape[0]
         g_elbo = g_nll + self.lam_kl * g_kl
+
         x_nll = {
             k: -net.u2x[k](
                 usamp[k], vsamp[getattr(net, f"{k}_idx")], xbch[k], l[k]
@@ -378,10 +380,35 @@ class SCGLUETrainer(GLUETrainer):
         vae_loss = self.lam_data * x_elbo_sum \
             + self.lam_graph * len(net.keys) * g_elbo \
             + self.lam_sup * sup_loss
+        
+        # cycle_loss = torch.tensor(0.0, device=self.net.device)
+        # for source_key in net.keys:
+        #     for target_key in net.keys:
+        #         if source_key == target_key:
+        #             continue
+        #         u_source, _ = net.x2u[source_key](x[source_key], xrep[source_key], lazy_normalizer=True) # No detach for gradients
+        #         usamp_source = u_source.rsample()
+        #         if self.normalize_u:
+        #             usamp_source = F.normalize(usamp_source, dim=1)
+
+        #         x_cycled_target_dist = net.u2x[target_key](usamp_source, vsamp[getattr(net, f"{target_key}_idx")], xbch[target_key], l[target_key])
+        #         x_cycled_target = x_cycled_target_dist.mean # Use mean for cycle reconstruction, could also sample
+
+        #         u_cycled_target, _ = net.x2u[target_key](x_cycled_target, xrep[target_key], lazy_normalizer=True)
+        #         usamp_cycled_target = u_cycled_target.rsample()
+        #         if self.normalize_u:
+        #             usamp_cycled_target = F.normalize(usamp_cycled_target, dim=1)
+
+        #         x_reconstructed_source_dist = net.u2x[source_key](usamp_cycled_target, vsamp[getattr(net, f"{source_key}_idx")], xbch[source_key], l[source_key])
+
+        #         # Calculate reconstruction loss based on the probabilistic model of source modality
+        #         recon_loss = -x_reconstructed_source_dist.log_prob(x[source_key]).mean()
+        #         cycle_loss = cycle_loss + recon_loss
+
         gen_loss = vae_loss - self.lam_align * dsc_loss - lam_depth * dsc_rds_loss
 
         losses = {
-            "dsc_loss": dsc_loss, "dsc_rds_loss": dsc_rds_loss, 
+            "dsc_loss": dsc_loss, "dsc_rds_loss": dsc_rds_loss,
             "vae_loss": vae_loss, "gen_loss": gen_loss,
             "g_nll": g_nll, "g_kl": g_kl, "g_elbo": g_elbo
         }
@@ -848,10 +875,18 @@ class SCGLUEModel(Model):
                 #     print(m.shape)
                 # for m in feature_masks:
                 #     print(m.min(), m.max())
+                # if we did not filter out any features, we can use the 2D convs
+                use_conv = False
+                for strata_k in range(n_strata):
+                    print(f'strata {strata_k}', len(strata_masks[strata_k]))
+                    use_conv = use_conv and len(strata_masks[strata_k]) == len(non_distal_indices)
+                #use_conv = False
+                print('use_conv', use_conv)
                 x2u[k] = _ENCODER_MAP[data_config["prob_model"]](
                     data_config["rep_dim"] or len(data_config["features"]), latent_dim,
                     h_depth=h_depth, h_dim=h_dim, dropout=dropout,
                     strata_masks=strata_masks,
+                    use_conv=use_conv,
                     downsample_min=0.5, downsample_max=0.9
                 )
                 u2x[k] = _DECODER_MAP[data_config["prob_model"]](

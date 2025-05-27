@@ -4,7 +4,7 @@ GLUE component modules for single-cell omics data
 
 import collections
 from abc import abstractmethod
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union
 
 import random
 import math
@@ -78,9 +78,10 @@ class GraphEncoder(glue.GraphEncoder):
         super().__init__()
         self.vrepr = torch.nn.Parameter(torch.zeros(vnum, out_features))
         self.conv = GraphConv()
-        self.conv2 = GraphConv()
-        # self.conv = GraphAttent(out_features, out_features)
-        # self.conv2 = GraphAttent(out_features, out_features)
+        # self.conv2 = GraphConv()
+        #self.conv = GraphAttent(out_features, out_features)
+        self.conv2 = GraphAttent(out_features, out_features)
+        self.conv3 = GraphAttent(out_features, out_features)
         self.dropout = torch.nn.AlphaDropout(p=0.1)
         #self.ln = torch.nn.LayerNorm(out_features * 2)
         self.loc = torch.nn.Linear(out_features, out_features)
@@ -93,9 +94,86 @@ class GraphEncoder(glue.GraphEncoder):
         ptr = F.selu(ptr)
         #ptr = self.dropout(ptr)
         ptr = self.conv2(ptr, eidx, enorm, esgn)
+        #ptr = self.conv3(ptr, eidx, enorm, esgn)
+        #ptr = self.dropout(ptr)
         loc = self.loc(ptr)
         std = F.softplus(self.std_lin(ptr)) + EPS
         return D.Normal(loc, std)
+    
+class DistanceSpecificGraphEncoder(glue.GraphEncoder):
+    r"""
+    Graph encoder producing distance-specific feature embeddings.
+
+    Parameters
+    ----------
+    vnum
+        Number of vertices
+    out_features
+        Output dimensionality (for each distance embedding)
+    n_strata
+        Number of distance strata embeddings to produce
+    node_attr_dim
+        (Optional) Dimensionality of node attributes
+    """
+    def __init__(
+            self, vnum: int, out_features: int, n_strata: int,
+            node_attr_dim: Optional[int] = None
+    ) -> None:
+        super().__init__()
+        self.n_strata = n_strata
+        self.vrepr = torch.nn.Parameter(torch.zeros(vnum, out_features)) # Shared base representation
+
+        if node_attr_dim is not None and node_attr_dim > 0:
+            self.use_node_attributes = True
+            self.node_attr_proj = torch.nn.Linear(node_attr_dim, out_features)
+        else:
+            self.use_node_attributes = False
+
+        #self.initial_projections = torch.nn.ModuleList()
+
+        self.conv1 = GraphConv()
+        self.conv2 = GraphConv()
+
+        self.strata_conv1 = torch.nn.ModuleList()
+        self.strata_loc = torch.nn.ModuleList()
+        self.strata_std_lin = torch.nn.ModuleList()
+
+
+        for _ in range(n_strata):
+            #self.initial_projections.append(torch.nn.Linear(out_features, out_features)) # Project base features differently
+            self.strata_conv1.append(GraphAttent(out_features, out_features))
+            self.strata_loc.append(torch.nn.Linear(out_features, out_features))
+            self.strata_std_lin.append(torch.nn.Linear(out_features, out_features))
+
+    def forward(
+            self, eidx: torch.Tensor, enorm: torch.Tensor, esgn: torch.Tensor,
+            node_attrs: Optional[torch.Tensor] = None
+    ) -> List[D.Normal]: # Returns a list of distributions
+
+        if self.use_node_attributes:
+            if node_attrs is None:
+                raise ValueError("Node attributes must be provided when use_node_attributes is True")
+            node_attr_embeddings = self.node_attr_proj(node_attrs)
+            initial_vrepr = self.vrepr + node_attr_embeddings
+        else:
+            initial_vrepr = self.vrepr
+
+        initial_vrepr = self.conv1(initial_vrepr, eidx, enorm, esgn)
+        initial_vrepr = F.selu(initial_vrepr)
+        initial_vrepr = self.conv2(initial_vrepr, eidx, enorm, esgn)
+
+        init_loc = self.strata_loc[0](initial_vrepr)
+        init_std = F.softplus(self.strata_std_lin[0](initial_vrepr)) + EPS
+        distributions = [D.Normal(init_loc, init_std)]
+
+        for k in range(1, self.n_strata):
+            # Propagate using the projected features
+            ptr = self.strata_conv1[k](initial_vrepr, eidx, enorm, esgn)
+            loc = self.strata_loc[k](ptr)
+            std = F.softplus(self.strata_std_lin[k](ptr)) + EPS
+            distributions.append(D.Normal(loc, std))
+
+        return distributions
     
 class GraphEncoderMultiStrata(glue.GraphEncoder):
 
@@ -373,6 +451,49 @@ class HiCDataEncoder(DataEncoder):
 
     TOTAL_COUNT = 5e4
 
+    def __init__(self, 
+                in_features: int, out_features: int,
+                h_depth: int = 2, h_dim: int = 256,
+                dropout: float = 0.2,
+                downsample_min: float = 0.0,
+                downsample_max: float = 1.0,
+                strata_masks: list = [],
+                use_conv=False):
+        if use_conv:
+            # ensure that the matrix can be halved as many times as the depth
+            depth = 3
+            pool_padding_len = len(strata_masks[0]) + (2 ** depth - len(strata_masks[0]) % 2 ** depth)
+            in_features += (pool_padding_len - len(strata_masks[0])) * len(strata_masks)
+        super().__init__(in_features, out_features, h_depth, h_dim, dropout, downsample_min, downsample_max)
+        self.strata_masks = strata_masks
+        self.use_conv = use_conv
+        if use_conv:
+            self.pool_padding_len = pool_padding_len
+            self.conv_net = torch.nn.Sequential(
+                torch.nn.Conv2d(1, 8, kernel_size=(3, 3), padding='same'),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(8, 8, kernel_size=(3, 3), padding='same'),
+                torch.nn.ReLU(),
+                #torch.nn.BatchNorm2d(8),
+                torch.nn.MaxPool2d((1, 2)),
+                torch.nn.Conv2d(8, 16, kernel_size=(3, 3), padding='same'),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(16, 16, kernel_size=(3, 3), padding='same'),
+                torch.nn.ReLU(),
+                #torch.nn.BatchNorm2d(16),
+                torch.nn.MaxPool2d((1, 2)),
+                torch.nn.Conv2d(16, 32, kernel_size=(3, 3), padding='same'),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(32, 32, kernel_size=(3, 3), padding='same'),
+                torch.nn.ReLU(),
+                #torch.nn.BatchNorm2d(16),
+                torch.nn.MaxPool2d((1, 2)),
+                torch.nn.Conv2d(32, 64, kernel_size=(3, 3), padding='same'),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(64, 8, kernel_size=(3, 3), padding='same'),
+            )
+        
+
     def compute_l(self, x: torch.Tensor) -> torch.Tensor:
         return x.sum(dim=1, keepdim=True)
 
@@ -381,6 +502,31 @@ class HiCDataEncoder(DataEncoder):
     ) -> torch.Tensor:
         return (x * (self.TOTAL_COUNT / l)).log1p()
         #return x.log1p()
+
+    def forward(  # pylint: disable=arguments-differ
+            self, x: torch.Tensor, xrep: torch.Tensor,
+            lazy_normalizer: bool = True
+    ) -> Tuple[D.Normal, Optional[torch.Tensor]]:
+        if xrep.numel():
+            l = None if lazy_normalizer else self.compute_l(x)
+            ptr = xrep
+        else:
+            l = self.compute_l(x)
+            ptr = self.normalize(x, l)
+        if self.use_conv:
+            # reshape into 2D matrix
+            x = ptr.view(-1, 1, len(self.strata_masks), len(self.strata_masks[0]))
+            x = F.pad(x, (0, self.pool_padding_len - len(self.strata_masks[0])))
+            ptr = self.conv_net(x)
+            ptr = ptr.view(ptr.size(0), -1)
+        for layer in range(self.h_depth):
+            ptr = getattr(self, f"linear_{layer}")(ptr)
+            ptr = getattr(self, f"act_{layer}")(ptr)
+            ptr = getattr(self, f"bn_{layer}")(ptr)
+            ptr = getattr(self, f"dropout_{layer}")(ptr)
+        loc = self.loc(ptr)
+        std = F.softplus(self.std_lin(ptr)) + EPS
+        return D.Normal(loc, std), l
     
 class HiCGraphConv(torch.nn.Module):
 
@@ -442,11 +588,10 @@ class HiCDataEncoderGraphConv(glue.DataEncoder):
     TOTAL_COUNT = 5e4
 
     def __init__(self, in_features: int, out_features: int, h_depth: int = 2, h_dim: int = 256, dropout: float = 0.2, downsample_min: float = 0, downsample_max: float = 1,
-                 strata_masks: list = []) -> None:
+                 strata_masks: list = [], use_rep=True) -> None:
         super().__init__()
         self.h_depth = h_depth
-        #ptr_dim = h_dim * len(strata_masks)
-        ptr_dim = in_features
+        ptr_dim = h_dim if use_rep else (h_dim * len(strata_masks))
         for layer in range(self.h_depth):
             setattr(self, f"linear_{layer}", torch.nn.Linear(ptr_dim, h_dim))
             setattr(self, f"act_{layer}", torch.nn.LeakyReLU(negative_slope=0.2))
@@ -457,17 +602,21 @@ class HiCDataEncoderGraphConv(glue.DataEncoder):
         self.std_lin = torch.nn.Linear(ptr_dim, out_features)
         self.conv = HiCGraphConv()
         self.strata_masks = strata_masks
+        self.use_rep = use_rep
         #self.strata_idxs = torch.nn.ParameterList([torch.nn.Parameter(torch.as_tensor(s), requires_grad=False) for s in strata_masks])
-        # self.layer_norms = []
-        # self.strata_projections = []
-        # for strata_k in range(len(strata_masks)):
-        #     #self.strata_idxs.append(torch.as_tensor(strata_masks[strata_k], device='cuda'))
-        #     self.layer_norms.append(torch.nn.LayerNorm(h_dim))
-        #     self.strata_projections.append(torch.nn.Linear(len(strata_masks[strata_k]), h_dim))
-        # self.layer_norms = torch.nn.ModuleList(self.layer_norms)
-        #self.
-        #self.final_layer_norm = torch.nn.LayerNorm(h_dim * len(strata_masks))
-        #self.strata_projections = torch.nn.ModuleList(self.strata_projections)
+        if use_rep:
+            self.layer_norm = torch.nn.LayerNorm(h_dim)
+            self.strata_projection = torch.nn.Linear(in_features, h_dim)
+        else:
+            self.layer_norms = []
+            self.strata_projections = []
+            for strata_k in range(len(strata_masks)):
+                #self.strata_idxs.append(torch.as_tensor(strata_masks[strata_k], device='cuda'))
+                self.layer_norms.append(torch.nn.LayerNorm(h_dim))
+                self.strata_projections.append(torch.nn.Linear(len(strata_masks[strata_k]), h_dim))
+            self.layer_norms = torch.nn.ModuleList(self.layer_norms)
+            self.strata_projections = torch.nn.ModuleList(self.strata_projections)
+            
         self.max_strata_size = 0
         for strata in strata_masks:
             self.max_strata_size = max(self.max_strata_size, len(strata))
@@ -491,25 +640,28 @@ class HiCDataEncoderGraphConv(glue.DataEncoder):
         else:
             l = self.compute_l(x)
             ptr = self.normalize(x, l)
-         
-        # conv_out = []
-        # for strata_k in range(len(self.strata_masks)):
-        #     x = ptr[:, self.strata_masks[strata_k]]
-        #     # for target_strata_k in range(len(self.strata_masks)):
-        #     #     if target_strata_k == strata_k:  # skip self-loops
-        #     #         continue
-        #     #     if len(self.strata_masks[target_strata_k]) < 1:
-        #     #         continue
-        #     #     source_idxs = self.strata_idxs[target_strata_k]  # source indices of all strata_k bins
-        #     #     target_idxs = torch.clip(source_idxs + target_strata_k - strata_k, 0, ptr.shape[1] - 1)  # targets are the same as sources, but shifted by the number of bins
-        #     #     eidx = torch.stack([source_idxs, target_idxs], dim=0)
-        #     #     x += self.conv(ptr, eidx)[:, self.strata_masks[strata_k]]
-        #     # x /= len(self.strata_masks) - 1
-        #     x = self.strata_projections[strata_k](x)
-        #     x = self.layer_norms[strata_k](x)
-        #     conv_out.append(x)
-        # ptr = torch.concat(conv_out, dim=1)
-        #ptr = self.final_layer_norm(ptr)
+        if self.use_rep:
+            x = ptr
+            x = self.strata_projection(x)
+            ptr = self.layer_norm(x)
+        else:
+            conv_out = []
+            for strata_k in range(len(self.strata_masks)):
+                x = ptr[:, self.strata_masks[strata_k]]
+                # for target_strata_k in range(len(self.strata_masks)):
+                #     if target_strata_k == strata_k:  # skip self-loops
+                #         continue
+                #     if len(self.strata_masks[target_strata_k]) < 1:
+                #         continue
+                #     source_idxs = self.strata_idxs[target_strata_k]  # source indices of all strata_k bins
+                #     target_idxs = torch.clip(source_idxs + target_strata_k - strata_k, 0, ptr.shape[1] - 1)  # targets are the same as sources, but shifted by the number of bins
+                #     eidx = torch.stack([source_idxs, target_idxs], dim=0)
+                #     x += self.conv(ptr, eidx)[:, self.strata_masks[strata_k]]
+                # x /= len(self.strata_masks) - 1
+                x = self.strata_projections[strata_k](x)
+                x = self.layer_norms[strata_k](x)
+                conv_out.append(x)
+            ptr = torch.concat(conv_out, dim=1)
         for layer in range(self.h_depth):
             ptr = getattr(self, f"linear_{layer}")(ptr)
             ptr = getattr(self, f"act_{layer}")(ptr)
@@ -957,7 +1109,7 @@ class StratifiedZINBDataDecoder(DataDecoder):
             #self.key_ln_layers.append(torch.nn.LayerNorm(embedding_size))
             self.attn_layers.append(LocalAttention(
                                     dim = embedding_size,
-                                    window_size = input_dim,
+                                    window_size = input_dim * 20,
                                     autopad = True,
                                     shared_qk = True))
             self.prenorm_layers.append(torch.nn.LayerNorm(embedding_size))
@@ -995,6 +1147,7 @@ class StratifiedZINBDataDecoder(DataDecoder):
             self.zi_logits = torch.nn.Parameter(torch.zeros(n_batches, out_features))
         self.attn_norm = 1 / math.sqrt(embedding_size)
         self.embedding_size = embedding_size
+        self.strata_weights = torch.nn.Parameter(torch.ones(input_dim))
 
     def forward(
             self, u: torch.Tensor, v: torch.Tensor,
@@ -1004,6 +1157,7 @@ class StratifiedZINBDataDecoder(DataDecoder):
         scale = F.softplus(self.scale_lin[b])
         log_theta = self.log_theta[b]
         #strata_start = 0
+        weights = F.softmax(self.strata_weights, dim=0)
         for k in range(self.input_dim):
             strata_indices = self.strata_masks[k]
             feature_indices = self.feature_masks[k]
@@ -1025,10 +1179,15 @@ class StratifiedZINBDataDecoder(DataDecoder):
                 
                 #v = self.strata_attn(qk, qk, v)
                 if self.use_attn:
-                    v = self.prenorm_layers[k - 1](v)
-                    qk = self.key_layers[k - 1](v)
-                    v = self.value_layers[k - 1](v)
-                    key = v + self.attn_layers[k - 1](qk, qk, v)
+                    # v = self.prenorm_layers[k - 1](v)
+                    # qk = self.key_layers[k - 1](v)
+                    # v = self.value_layers[k - 1](v)
+                    # key = v + self.attn_layers[k - 1](qk, qk, v)
+                    # key = key + self.ff_activations[k - 1](self.ff_layers[k - 1](self.postnorm_layers[k - 1](key)))
+                    prenorm = self.prenorm_layers[k - 1](v)
+                    qk = self.key_layers[k - 1](prenorm)
+                    v = self.value_layers[k - 1](prenorm)
+                    key = v + self.attn_layers[k - 1](qk, qk, prenorm)
                     key = key + self.ff_activations[k - 1](self.ff_layers[k - 1](self.postnorm_layers[k - 1](key)))
                 else:
                     key = self.key_convs[k - 1](v.t()).t()
@@ -1054,7 +1213,7 @@ class StratifiedZINBDataDecoder(DataDecoder):
             if self.binarize:
                 mu = logit_mu
             else:
-                mu = F.softmax(logit_mu, dim=1) * l
+                mu = F.softmax(logit_mu, dim=1) * l * weights[k]
             mu_slices.append(mu)
 
         mu = torch.concat(mu_slices, dim=1)  # because of this we need at least the strata to be sorted in the node embedding
