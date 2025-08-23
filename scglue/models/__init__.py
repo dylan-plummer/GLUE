@@ -237,6 +237,7 @@ def fit_SCGLUE(
                                         adatas['hic'], pretrain.modalities['hic'], 
                                         graph, sorted(graph.nodes),
                                         node_attr_anndata,
+                                        atac=adatas.get('atac', None), atac_data_config=pretrain.modalities.get('atac', None),
                                         latent_dim=init_kws['latent_dim'],
                                         prefix='pretrain',
                                         save_interval=fit_kws.get('save_interval', 10))

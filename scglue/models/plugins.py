@@ -262,6 +262,7 @@ class EmbeddingVisualizer(TrainingPlugin):
             hic, hic_data_config,
             graph, vertices,
             features_ad: ad.AnnData,
+            atac=None, atac_data_config=None,
             latent_dim=64,
             prefix='pretrain',
             out_dir: str = 'tmp_imgs',
@@ -272,6 +273,8 @@ class EmbeddingVisualizer(TrainingPlugin):
         self.rna_data_config = rna_data_config
         self.hic = hic
         self.hic.obs['sorted_celltype'] = self.hic.obs['celltype']
+        self.atac = atac
+        self.atac_data_config = atac_data_config
         self.graph = graph
         self.vertices = pd.Index(vertices)
         self.features_ad = features_ad
@@ -354,6 +357,27 @@ class EmbeddingVisualizer(TrainingPlugin):
                     result.append(u.mean.detach().cpu())
                 result = torch.cat(result).numpy()
                 self.rna.obsm['X_glue'] = result
+
+                if self.atac is not None:
+                    # get atac embeddings
+                    encoder = net.x2u['atac']
+                    data = AnnDataset([self.atac], [self.atac_data_config], mode='eval', getitem_size=128)
+                    data_loader = DataLoader(
+                        data, batch_size=1, shuffle=False,
+                        num_workers=config.DATALOADER_NUM_WORKERS,
+                        pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
+                        persistent_workers=False
+                    )
+                    result = []
+                    for x, xrep, *_ in data_loader:
+                        u = encoder(
+                            x.to(net.device, non_blocking=True),
+                            xrep.to(net.device, non_blocking=True),
+                            lazy_normalizer=True
+                        )[0]
+                        result.append(u.mean.detach().cpu())
+                    result = torch.cat(result).numpy()
+                    self.atac.obsm['X_glue'] = result
 
                 # get feature embeddings
                 print('Embedding features...')
@@ -861,6 +885,8 @@ class EmbeddingVisualizer(TrainingPlugin):
 
 
                 transfer_labels(self.rna, self.hic, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
+                if self.atac is not None:
+                    transfer_labels(self.rna, self.atac, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
 
                 # compute pca
                 pca_out_dir = f'{self.out_dir}/pca'
@@ -874,6 +900,12 @@ class EmbeddingVisualizer(TrainingPlugin):
                 self.hic.obs['agglomerative'] = AgglomerativeClustering(n_clusters=len(self.hic.obs['celltype'].unique())).fit_predict(self.hic.obsm['X_glue'])
                 # set leiden to int to avoid clash with colormap
                 self.hic.obs['leiden'] = self.hic.obs['leiden'].astype(int)
+
+                if self.atac is not None:
+                    sc.tl.leiden(self.atac)
+                    #self.atac.obs['kmeans'] = KMeans(n_clusters=len(self.atac.obs['celltype'].unique())).fit_predict(self.atac.obsm['X_glue'])
+                    self.atac.obs['agglomerative'] = AgglomerativeClustering(n_clusters=len(self.atac.obs['celltype'].unique())).fit_predict(self.atac.obsm['X_glue'])
+                    self.atac.obs['leiden'] = self.atac.obs['leiden'].astype(int)
 
                 wspace = 0.45
                 palette = None
@@ -914,12 +946,34 @@ class EmbeddingVisualizer(TrainingPlugin):
                 fig.savefig(f'{umap_out_dir}/{self.prefix}_umap_{save_i}.png')
                 plt.close()
 
+                if self.atac is not None:
+                    # also visualize atac embeddings
+                    x_pca = PCA(n_components=2).fit_transform(self.atac.obsm['X_glue'])
+                    self.atac.obsm['X_pca'] = x_pca
+                    atac_pca_out_dir = f'{self.out_dir}/atac/pca'
+                    os.makedirs(atac_pca_out_dir, exist_ok=True)
+                    sc.set_figure_params()
+                    fig = sc.pl.pca(self.atac, color=["celltype", "pred_celltype", "batch"], ncols=3, wspace=wspace, return_fig=True)
+                    fig.savefig(f'{atac_pca_out_dir}/{self.prefix}_pca_atac_{save_i}.png')
+                    plt.close()
+                    sc.pp.neighbors(self.atac, use_rep="X_glue", metric="cosine")
+                    sc.tl.umap(self.atac)
+                    atac_umap_out_dir = f'{self.out_dir}/atac/umap'
+                    os.makedirs(atac_umap_out_dir, exist_ok=True)
+                    fig = sc.pl.umap(self.atac, color=["celltype", "pred_celltype", "batch"], ncols=3, wspace=wspace, return_fig=True)
+                    fig.savefig(f'{atac_umap_out_dir}/{self.prefix}_umap_atac_{save_i}.png')
+                    plt.close()
+
                 # if rna dataset is small enough, visualize joint embeddings
                 if self.rna.shape[0] < 5000:
                     self.hic.obs['domain'] = 'hic'
                     self.rna.obs['domain'] = 'rna'
                     self.rna.obs['pred_celltype'] = self.rna.obs['celltype']
-                    combined = ad.concat([self.hic, self.rna])
+                    if self.atac is not None:
+                        self.atac.obs['domain'] = 'atac'
+                        combined = ad.concat([self.hic, self.rna, self.atac])
+                    else:
+                        combined = ad.concat([self.hic, self.rna])
                     # compute pca
                     pca_out_dir = f'{self.out_dir}/joint/pca'
                     os.makedirs(pca_out_dir, exist_ok=True)
@@ -947,6 +1001,12 @@ class EmbeddingVisualizer(TrainingPlugin):
                 self.hic.obs['celltype_int'] = self.hic.obs['celltype'].map(celltype_map)
                 self.hic.obs['pred_celltype'] = self.hic.obs['pred_celltype'].apply(lambda s: s if s in celltypes else 'Other')
                 self.hic.obs['pred_celltype_int'] = self.hic.obs['pred_celltype'].map(celltype_map)
+                if self.atac is not None:
+                    atac_celltypes = list(sorted(self.atac.obs['celltype'].unique())) + ['Other']
+                    atac_celltype_map = {c: i for i, c in enumerate(atac_celltypes)}
+                    self.atac.obs['celltype_int'] = self.atac.obs['celltype'].map(atac_celltype_map)
+                    self.atac.obs['pred_celltype'] = self.atac.obs['pred_celltype'].apply(lambda s: s if s in rna_celltypes else 'Other')
+                    self.atac.obs['pred_celltype_int'] = self.atac.obs['pred_celltype'].map(rna_celltype_map)
 
                 confusion_matrix_out_dir = f'{self.out_dir}/confusion_matrix'
                 os.makedirs(confusion_matrix_out_dir, exist_ok=True)
@@ -982,12 +1042,39 @@ class EmbeddingVisualizer(TrainingPlugin):
                 except ValueError:  # not enough clusters
                     sil_celltype = 0
 
+                if self.atac is not None:
+                    atac_ari_leiden = adjusted_rand_score(self.atac.obs['celltype_int'], self.atac.obs['leiden'])
+                    atac_ari_kmeans = adjusted_rand_score(self.atac.obs['celltype_int'], self.atac.obs['agglomerative'])
+                    try:
+                        atac_sil_score_leiden = silhouette_score(self.atac.obsm['X_glue'], self.atac.obs['leiden'])
+                    except ValueError:  # not enough clusters
+                        atac_sil_score_leiden = 0
+                    try:
+                        atac_sil_score_kmeans = silhouette_score(self.atac.obsm['X_glue'], self.atac.obs['agglomerative'])
+                    except ValueError:  # not enough clusters
+                        atac_sil_score_kmeans = 0
+                    try:
+                        atac_sil_score_joint = silhouette_score(self.atac.obsm['X_glue'], self.atac.obs['pred_celltype_int'])
+                    except ValueError:  # not enough clusters
+                        atac_sil_score_joint = 0
+                    try:
+                        atac_sil_celltype = silhouette_score(self.atac.obsm['X_glue'], self.atac.obs['celltype_int'])
+                    except ValueError:  # not enough clusters
+                        atac_sil_celltype = 0   
+
                 # measure ari in joint embedding space (usually better than in Hi-C only space)
                 ari_joint = adjusted_rand_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'])
                 f1_micro = f1_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'], average='micro', labels=list(range(len(celltypes))))
                 f1_macro = f1_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'], average='macro', labels=list(range(len(celltypes))))
                 accuracy = accuracy_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'])
                 balanced_accuracy = balanced_accuracy_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'])
+
+                if self.atac is not None:
+                    atac_ari_joint = adjusted_rand_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'])
+                    atac_f1_micro = f1_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'], average='micro', labels=list(range(len(celltypes))))
+                    atac_f1_macro = f1_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'], average='macro', labels=list(range(len(celltypes))))
+                    atac_accuracy = accuracy_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'])
+                    atac_balanced_accuracy = balanced_accuracy_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'])
 
                 val_accuracy = 0
                 val_balanced_accuracy = 0
@@ -1090,7 +1177,8 @@ class EmbeddingVisualizer(TrainingPlugin):
 
                 
                 self.logger.info(f"ARI (Hi-C only): {ari_kmeans:.2f}, ARI (joint): {ari_joint:.2f}, Accuracy (joint): {accuracy:.2f}, Balanced Accuracy (joint): {balanced_accuracy:.2f}")
-                wandb.log({f"ari_{self.prefix}": ari_kmeans, 
+                
+                log_dict = {f"ari_{self.prefix}": ari_kmeans, 
                            f"ari_leiden_{self.prefix}": ari_leiden,
                            f"ari_joint_{self.prefix}": ari_joint, 
                             f"f1_micro_{self.prefix}": f1_micro,
@@ -1108,7 +1196,23 @@ class EmbeddingVisualizer(TrainingPlugin):
                             f"silhouette_kmeans_{self.prefix}": sil_score_kmeans,
                             f"silhouette_joint_{self.prefix}": sil_score_joint,
                             f"silhouette_celltype_{self.prefix}": sil_celltype,
-                           "epoch": epoch}, step=epoch)
+                           "epoch": epoch}
+                if self.atac is not None:
+                    self.logger.info(f"Atac ARI (Leiden): {atac_ari_leiden:.2f}, Atac ARI (KMeans): {atac_ari_kmeans:.2f}, Atac ARI (joint): {atac_ari_joint:.2f}, Atac Accuracy (joint): {atac_accuracy:.2f}, Atac Balanced Accuracy (joint): {atac_balanced_accuracy:.2f}")
+                    log_dict.update({
+                           f"atac_ari_{self.prefix}": atac_ari_kmeans, 
+                           f"atac_ari_leiden_{self.prefix}": atac_ari_leiden,
+                           f"atac_ari_joint_{self.prefix}": atac_ari_joint, 
+                            f"atac_f1_micro_{self.prefix}": atac_f1_micro,
+                            f"atac_f1_macro_{self.prefix}": atac_f1_macro,
+                           f"atac_accuracy_{self.prefix}": atac_accuracy,
+                            f"atac_balanced_accuracy_{self.prefix}": atac_balanced_accuracy,
+                            f"atac_silhouette_leiden_{self.prefix}": atac_sil_score_leiden,
+                            f"atac_silhouette_kmeans_{self.prefix}": atac_sil_score_kmeans,
+                            f"atac_silhouette_joint_{self.prefix}": atac_sil_score_joint,
+                            f"atac_silhouette_celltype_{self.prefix}": atac_sil_celltype,
+                    })
+                wandb.log(log_dict, step=epoch)
                 #wandb.log({**gene_attention_corrs, **celltype_gene_attention_corrs})
                 
 
