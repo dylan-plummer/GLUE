@@ -817,10 +817,10 @@ class SCGLUEModel(Model):
             else:
                 idx[k] = self.vertices.get_indexer(data_config["features"]).astype(np.int64)
             if idx[k].min() < 0 and data_config["prob_model"] not in ['HiCNB', 'HiCZINB']:  # 2D Hi-C inputs only contain one node per strata
-                print(idx[k])
-                print(k)
-                print(data_config["features"][-1])
-                print(data_config["prob_model"])
+                # print(idx[k])
+                # print(k)
+                # print(data_config["features"][-1])
+                # print(data_config["prob_model"])
                 for i in range(len(data_config["features"])):
                     if data_config["features"][i] not in self.vertices:
                         print(i, data_config["features"][i])

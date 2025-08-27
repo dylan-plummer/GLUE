@@ -160,6 +160,7 @@ def load_model(fname: os.PathLike) -> Model:
 @logged
 def fit_SCGLUE(
         adatas: Mapping[str, AnnData], graph: nx.Graph, model: type = SCGLUEModel,
+        skip_balance: bool = False,
         init_kws: Kws = None, compile_kws: Kws = None, fit_kws: Kws = None,
         balance_kws: Kws = None, log_wandb: bool = False
 ) -> SCGLUEModel:
@@ -229,15 +230,14 @@ def fit_SCGLUE(
         node_attr_df['pos'].append(weight_dict[node])
         node_attr_df['degree'].append(graph.degree[node])
     node_attr_df = pd.DataFrame(node_attr_df, index=sorted(graph.nodes))
-    print(node_attr_df)
     # create anndata for node attributes using g2v.vrepr as init X
     node_attr_anndata = AnnData(pretrain.net.g2v.vrepr.cpu().detach().numpy(), obs=node_attr_df)
-    print(node_attr_anndata)
     embedding_viz = EmbeddingVisualizer(adatas['rna'], pretrain.modalities['rna'],
                                         adatas['hic'], pretrain.modalities['hic'], 
                                         graph, sorted(graph.nodes),
                                         node_attr_anndata,
                                         atac=adatas.get('atac', None), atac_data_config=pretrain.modalities.get('atac', None),
+                                        methyl=adatas.get('methyl', None), methyl_data_config=pretrain.modalities.get('methyl', None),
                                         latent_dim=init_kws['latent_dim'],
                                         prefix='pretrain',
                                         save_interval=fit_kws.get('save_interval', 10))
@@ -245,24 +245,25 @@ def fit_SCGLUE(
     if "directory" in pretrain_fit_kws:
         pretrain.save(os.path.join(pretrain_fit_kws["directory"], "pretrain.dill"))
 
-    fit_SCGLUE.logger.info("Estimating balancing weight...")
-    for k, adata in adatas.items():
-        adata.obsm[f"X_{config.TMP_PREFIX}"] = pretrain.encode_data(k, adata)
-    if init_kws.get("shared_batches"):
-        use_batch = set(
-            adata.uns[config.ANNDATA_KEY]["use_batch"]
-            for adata in adatas.values()
+    if not skip_balance:
+        fit_SCGLUE.logger.info("Estimating balancing weight...")
+        for k, adata in adatas.items():
+            adata.obsm[f"X_{config.TMP_PREFIX}"] = pretrain.encode_data(k, adata)
+        if init_kws.get("shared_batches"):
+            use_batch = set(
+                adata.uns[config.ANNDATA_KEY]["use_batch"]
+                for adata in adatas.values()
+            )
+            use_batch = use_batch.pop() if len(use_batch) == 1 else None
+        else:
+            use_batch = None
+        estimate_balancing_weight(
+            *adatas.values(), use_rep=f"X_{config.TMP_PREFIX}", use_batch=use_batch,
+            key_added="balancing_weight", **balance_kws
         )
-        use_batch = use_batch.pop() if len(use_batch) == 1 else None
-    else:
-        use_batch = None
-    estimate_balancing_weight(
-        *adatas.values(), use_rep=f"X_{config.TMP_PREFIX}", use_batch=use_batch,
-        key_added="balancing_weight", **balance_kws
-    )
-    for adata in adatas.values():
-        adata.uns[config.ANNDATA_KEY]["use_dsc_weight"] = "balancing_weight"
-        del adata.obsm[f"X_{config.TMP_PREFIX}"]
+        for adata in adatas.values():
+            adata.uns[config.ANNDATA_KEY]["use_dsc_weight"] = "balancing_weight"
+            del adata.obsm[f"X_{config.TMP_PREFIX}"]
 
     fit_SCGLUE.logger.info("Fine-tuning SCGLUE model...")
     finetune_fit_kws = fit_kws.copy()
@@ -279,12 +280,12 @@ def fit_SCGLUE(
     fit_SCGLUE.logger.debug("Increasing random seed by 1 to prevent idential data order...")
     finetune.random_seed += 1
     node_attr_anndata = AnnData(pretrain.net.g2v.vrepr.cpu().detach().numpy(), obs=node_attr_df)
-    print(node_attr_anndata)
     embedding_viz = EmbeddingVisualizer(adatas['rna'], pretrain.modalities['rna'],
                                         adatas['hic'], pretrain.modalities['hic'],
                                         graph, sorted(graph.nodes), 
                                         node_attr_anndata,
                                         atac=adatas.get('atac', None), atac_data_config=pretrain.modalities.get('atac', None),
+                                        methyl=adatas.get('methyl', None), methyl_data_config=pretrain.modalities.get('methyl', None),
                                         latent_dim=init_kws['latent_dim'],
                                         prefix='finetune',
                                         save_interval=fit_kws.get('save_interval', 10))
