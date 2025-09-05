@@ -1254,7 +1254,10 @@ class EmbeddingVisualizer(TrainingPlugin):
                             f"methyl_silhouette_joint_{self.prefix}": methyl_sil_score_joint,
                             f"methyl_silhouette_celltype_{self.prefix}": methyl_sil_celltype,
                     })
-                wandb.log(log_dict, step=epoch)
+                try:
+                    wandb.log(log_dict, step=epoch)
+                except Exception as e:
+                    self.logger.error(f"Error logging to wandb: {e}")
                 #wandb.log({**gene_attention_corrs, **celltype_gene_attention_corrs})
                 
 

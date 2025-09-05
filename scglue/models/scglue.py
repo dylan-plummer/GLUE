@@ -550,9 +550,9 @@ class PairedSCGLUETrainer(SCGLUETrainer):
         device = self.net.device
         keys = self.net.keys
         K = len(keys)
-        x, xrep, xbch, xlbl, xdwt, pmsk, (eidx, ewt, esgn) = \
-            data[0:K], data[K:2*K], data[2*K:3*K], data[3*K:4*K], data[4*K:5*K], \
-            data[5*K], data[5*K+1:]
+        x, xrep, xbch, xlbl, xdwt, xrds, pmsk, (eidx, ewt, esgn) = \
+            data[0:K], data[K:2*K], data[2*K:3*K], data[3*K:4*K], data[4*K:5*K], data[5*K:6*K], \
+            data[6*K], data[6*K+1:]
         x = {
             k: x[i].to(device, non_blocking=True)
             for i, k in enumerate(keys)
@@ -573,6 +573,10 @@ class PairedSCGLUETrainer(SCGLUETrainer):
             k: xdwt[i].to(device, non_blocking=True)
             for i, k in enumerate(keys)
         }
+        xrds = {
+            k: xrds[i].to(device, non_blocking=True)
+            for i, k in enumerate(keys)
+        }
         xflag = {
             k: torch.as_tensor(
                 i, dtype=torch.int64, device=device
@@ -583,13 +587,14 @@ class PairedSCGLUETrainer(SCGLUETrainer):
         eidx = eidx.to(device, non_blocking=True)
         ewt = ewt.to(device, non_blocking=True)
         esgn = esgn.to(device, non_blocking=True)
-        return x, xrep, xbch, xlbl, xdwt, xflag, pmsk, eidx, ewt, esgn
+        return x, xrep, xbch, xlbl, xdwt, xrds, xflag, pmsk, eidx, ewt, esgn
 
     def compute_losses(
             self, data: PairedDataTensors, epoch: int, dsc_only: bool = False
     ) -> Mapping[str, torch.Tensor]:
+        lam_depth = 0.05
         net = self.net
-        x, xrep, xbch, xlbl, xdwt, xflag, pmsk, eidx, ewt, esgn = data
+        x, xrep, xbch, xlbl, xdwt, xrds, xflag, pmsk, eidx, ewt, esgn = data
 
         u, l = {}, {}
         for k in net.keys:
@@ -602,6 +607,8 @@ class PairedSCGLUETrainer(SCGLUETrainer):
         u_cat = torch.cat([u[k].mean for k in net.keys])
         xbch_cat = torch.cat([xbch[k] for k in net.keys])
         xdwt_cat = torch.cat([xdwt[k] for k in net.keys])
+        xrds_cat = torch.cat([xrds[k] for k in net.keys])
+        xrds_weight = torch.cat([torch.ones_like(xrds[k]) if k == 'hic' else torch.zeros_like(xrds[k]) for k in net.keys])
         xflag_cat = torch.cat([xflag[k] for k in net.keys])
         anneal = max(1 - (epoch - 1) / self.align_burnin, 0) \
             if self.align_burnin else 0
@@ -610,8 +617,11 @@ class PairedSCGLUETrainer(SCGLUETrainer):
             u_cat = u_cat + (anneal * self.BURNIN_NOISE_EXAG) * noise
         dsc_loss = F.cross_entropy(net.du(u_cat, xbch_cat), xflag_cat, reduction="none")
         dsc_loss = (dsc_loss * xdwt_cat).sum() / xdwt_cat.numel()
+        xrds_pred = net.durds(u_cat, xbch_cat)
+        #dsc_rds_loss = F.smooth_l1_loss(xrds_pred, xrds_cat)
+        dsc_rds_loss = F.binary_cross_entropy_with_logits(xrds_pred, xrds_cat, weight=xrds_weight)
         if dsc_only:
-            return {"dsc_loss": self.lam_align * dsc_loss}
+            return {"dsc_loss": self.lam_align * dsc_loss + lam_depth * dsc_rds_loss}
 
         v = net.g2v(self.eidx, self.enorm, self.esgn)
         vsamp = v.rsample()
@@ -712,10 +722,11 @@ class PairedSCGLUETrainer(SCGLUETrainer):
             + self.lam_joint_cross * joint_cross_loss \
             + self.lam_real_cross * real_cross_loss \
             + self.lam_cos * cos_loss
-        gen_loss = vae_loss - self.lam_align * dsc_loss
+        gen_loss = vae_loss - self.lam_align * dsc_loss - lam_depth * dsc_rds_loss
 
         losses = {
-            "dsc_loss": dsc_loss, "vae_loss": vae_loss, "gen_loss": gen_loss,
+            "dsc_loss": dsc_loss, "dsc_rds_loss": dsc_rds_loss,
+            "vae_loss": vae_loss, "gen_loss": gen_loss,
             "g_nll": g_nll, "g_kl": g_kl, "g_elbo": g_elbo,
             "joint_cross_loss": joint_cross_loss,
             "real_cross_loss": real_cross_loss,
@@ -870,11 +881,6 @@ class SCGLUEModel(Model):
 
                     strata_masks.append(np.array(distal_indices))
                     feature_masks.append(np.array(distal_feature_indices))
-                #print(feature_masks)
-                # for m in strata_masks:
-                #     print(m.shape)
-                # for m in feature_masks:
-                #     print(m.min(), m.max())
                 # if we did not filter out any features, we can use the 2D convs
                 use_conv = False
                 for strata_k in range(n_strata):
