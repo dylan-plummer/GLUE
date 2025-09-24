@@ -56,7 +56,6 @@ register_prob_model("ZIN", sc.VanillaDataEncoder, sc.ZINDataDecoder)
 register_prob_model("ZILN", sc.VanillaDataEncoder, sc.ZILNDataDecoder)
 register_prob_model("NB", sc.NBDataEncoder, sc.NBDataDecoder)
 register_prob_model("ZINB", sc.NBDataEncoder, sc.ZINBDataDecoder)
-register_prob_model("HiCNB", sc.HiCDataEncoder, sc.StratifiedNBDataDecoder)  # same encoder but strata-specific decoder
 register_prob_model("HiCZINB", sc.HiCDataEncoder, sc.StratifiedZINBDataDecoder)  # same encoder but strata-specific decoder
 
 

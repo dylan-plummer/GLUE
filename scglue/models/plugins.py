@@ -684,10 +684,12 @@ class EmbeddingVisualizer(TrainingPlugin):
                             v = strata_ad.X
                             v = torch.as_tensor(v, device=net.device)
                             #key_conv = net.u2x['hic'].key_convs[k]
-                            v = net.u2x['hic'].prenorm_layers[k](v)
-                            qk = net.u2x['hic'].key_layers[k](v)
-                            v = net.u2x['hic'].value_layers[k](v)
-                            feats = net.u2x['hic'].attn_layers[k](qk, qk, v)
+                            prenorm = net.u2x['hic'].prenorm_layers[k](v)
+                            qk = net.u2x['hic'].key_layers[k](prenorm)
+                            v = net.u2x['hic'].value_layers[k](prenorm)
+                            key = v + net.u2x['hic'].attn_layers[k](qk, qk, prenorm)
+                            key = key + net.u2x['hic'].ff_activations[k - 1](net.u2x['hic'].ff_layers[k - 1](net.u2x['hic'].postnorm_layers[k - 1](key)))
+                            feats = key
                             attn_mat = torch.matmul(qk[strata_ad_mask, :], qk[strata_ad_mask, :].T) / math.sqrt(qk[strata_ad_mask, :].shape[1])
                             attn_mats.append(attn_mat.detach().cpu().numpy())
                             #feats = key_conv(v.t()).t()
